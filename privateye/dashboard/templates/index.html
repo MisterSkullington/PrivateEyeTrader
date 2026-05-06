@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PrivateEyeTrader</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e;
+    --green: #3fb950; --red: #f85149; --yellow: #d29922; --blue: #58a6ff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'SF Mono', 'Fira Code', monospace; font-size: 13px; }
+  header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; }
+  header h1 { font-size: 16px; color: var(--blue); letter-spacing: 2px; }
+  #status-pill { padding: 4px 12px; border-radius: 12px; font-size: 11px; font-weight: bold; }
+  .active { background: #1a3a1a; color: var(--green); }
+  .halted { background: #3a1a1a; color: var(--red); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; padding: 16px 24px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+  .card .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
+  .card .value { font-size: 20px; font-weight: bold; }
+  .pos { color: var(--green); } .neg { color: var(--red); } .neu { color: var(--text); }
+  .chart-wrap { padding: 0 24px 16px; }
+  .chart-box { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+  .chart-box h3 { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px; }
+  table { width: 100%; border-collapse: collapse; }
+  th { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+  td { padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: 12px; }
+  tr:last-child td { border-bottom: none; }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 0 24px 16px; }
+  #kill-btn { background: var(--red); color: white; border: none; padding: 10px 24px; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 13px; letter-spacing: 1px; }
+  #kill-btn:hover { background: #c03030; }
+  #resume-btn { background: var(--green); color: white; border: none; padding: 10px 24px; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 13px; letter-spacing: 1px; margin-left: 8px; }
+  #resume-btn:hover { background: #2a9040; }
+  .controls { padding: 0 24px 16px; display: flex; align-items: center; gap: 12px; }
+  #ws-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); display: inline-block; margin-right: 4px; }
+  .ws-connected { background: var(--green) !important; }
+  footer { padding: 12px 24px; color: var(--muted); font-size: 11px; border-top: 1px solid var(--border); }
+  @media (max-width: 768px) { .two-col { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🔍 PRIVATEEYETRADER</h1>
+  <div style="display:flex;align-items:center;gap:16px;">
+    <span><span id="ws-dot"></span><span id="ws-label">Connecting…</span></span>
+    <span id="status-pill" class="active">ACTIVE</span>
+    <span id="clock" style="color:var(--muted)"></span>
+  </div>
+</header>
+
+<!-- Summary cards -->
+<div class="grid">
+  <div class="card">
+    <div class="label">Equity</div>
+    <div class="value neu" id="equity">—</div>
+  </div>
+  <div class="card">
+    <div class="label">Cash</div>
+    <div class="value neu" id="cash">—</div>
+  </div>
+  <div class="card">
+    <div class="label">Daily PnL</div>
+    <div class="value" id="daily-pnl">—</div>
+  </div>
+  <div class="card">
+    <div class="label">Daily Drawdown</div>
+    <div class="value" id="daily-dd">—</div>
+  </div>
+  <div class="card">
+    <div class="label">Open Positions</div>
+    <div class="value neu" id="open-pos">—</div>
+  </div>
+  <div class="card">
+    <div class="label">Total Trades</div>
+    <div class="value neu" id="total-trades">—</div>
+  </div>
+</div>
+
+<!-- Kill switch controls -->
+<div class="controls">
+  <button id="kill-btn" onclick="killSwitch()">⚠ KILL SWITCH — FLATTEN ALL</button>
+  <button id="resume-btn" onclick="resumeTrading()">▶ RESUME TRADING</button>
+  <span id="halt-msg" style="color:var(--red);font-size:12px;"></span>
+</div>
+
+<!-- Equity curve chart -->
+<div class="chart-wrap">
+  <div class="chart-box">
+    <h3>Equity Curve</h3>
+    <canvas id="equityChart" height="120"></canvas>
+  </div>
+</div>
+
+<!-- Positions + Trades -->
+<div class="two-col">
+  <div class="chart-box">
+    <h3>Open Positions</h3>
+    <table>
+      <thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Stop</th><th>Bars</th></tr></thead>
+      <tbody id="positions-body"><tr><td colspan="6" style="color:var(--muted);text-align:center">No open positions</td></tr></tbody>
+    </table>
+  </div>
+  <div class="chart-box">
+    <h3>Recent Signals / Fills</h3>
+    <table>
+      <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Price</th><th>PnL</th></tr></thead>
+      <tbody id="signals-body"><tr><td colspan="6" style="color:var(--muted);text-align:center">No fills yet</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Trade log -->
+<div class="chart-wrap">
+  <div class="chart-box">
+    <h3>Trade Log — XAI Decision Trail</h3>
+    <table>
+      <thead><tr><th>Symbol</th><th>Side</th><th>Entry</th><th>Exit</th><th>PnL</th><th>PnL%</th><th>Bars</th><th>Exit Reason</th><th>Strategy</th></tr></thead>
+      <tbody id="trades-body"><tr><td colspan="9" style="color:var(--muted);text-align:center">No completed trades</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<footer>PrivateEyeTrader v1.0 — Phase 1 | All times UTC | Kill switch closes all positions at market and halts new signals</footer>
+
+<script>
+  // ── Chart setup ────────────────────────────────────────────────────────
+  const ctx = document.getElementById('equityChart').getContext('2d');
+  const equityData = { labels: [], datasets: [{ label: 'Equity', data: [], borderColor: '#58a6ff', backgroundColor: 'rgba(88,166,255,0.08)', tension: 0.3, pointRadius: 0, fill: true }] };
+  const equityChart = new Chart(ctx, { type: 'line', data: equityData, options: { animation: false, scales: { x: { display: false }, y: { grid: { color: '#30363d' }, ticks: { color: '#8b949e' } } }, plugins: { legend: { display: false } }, responsive: true } });
+
+  // ── WebSocket ──────────────────────────────────────────────────────────
+  let ws;
+  function connectWS() {
+    ws = new WebSocket(`ws://${location.host}/ws`);
+    ws.onopen = () => { document.getElementById('ws-dot').className = 'ws-connected'; document.getElementById('ws-label').textContent = 'Live'; };
+    ws.onclose = () => { document.getElementById('ws-dot').className = ''; document.getElementById('ws-label').textContent = 'Reconnecting…'; setTimeout(connectWS, 3000); };
+    ws.onmessage = (e) => {
+      const d = JSON.parse(e.data);
+      if (d.event === 'update') {
+        document.getElementById('equity').textContent = '$' + d.equity.toFixed(2);
+        document.getElementById('cash').textContent = '$' + d.cash.toFixed(2);
+        const dpnl = d.daily_pnl;
+        document.getElementById('daily-pnl').textContent = (dpnl >= 0 ? '+' : '') + '$' + dpnl.toFixed(2);
+        document.getElementById('daily-pnl').className = 'value ' + (dpnl >= 0 ? 'pos' : 'neg');
+        const dd = (d.drawdown_pct * 100).toFixed(2);
+        document.getElementById('daily-dd').textContent = dd + '%';
+        document.getElementById('daily-dd').className = 'value ' + (d.drawdown_pct > 0.02 ? 'neg' : 'neu');
+        document.getElementById('open-pos').textContent = d.open_positions;
+        document.getElementById('total-trades').textContent = d.total_trades;
+        const pill = document.getElementById('status-pill');
+        if (d.halted) { pill.textContent = 'HALTED'; pill.className = 'halted'; document.getElementById('halt-msg').textContent = 'Trading halted — use Resume to restart'; }
+        else { pill.textContent = 'ACTIVE'; pill.className = 'active'; document.getElementById('halt-msg').textContent = ''; }
+        // Update equity chart
+        equityData.labels.push(d.timestamp.substring(11,19));
+        equityData.datasets[0].data.push(d.equity);
+        if (equityData.labels.length > 200) { equityData.labels.shift(); equityData.datasets[0].data.shift(); }
+        equityChart.update('none');
+      }
+      if (d.event === 'kill') { alert('⚠ KILL SWITCH ACTIVATED: ' + d.message); }
+    };
+  }
+  connectWS();
+
+  // ── Clock ──────────────────────────────────────────────────────────────
+  setInterval(() => { document.getElementById('clock').textContent = new Date().toUTCString().substring(17, 25) + ' UTC'; }, 1000);
+
+  // ── REST polling ───────────────────────────────────────────────────────
+  async function fetchPositions() {
+    const r = await fetch('/api/positions'); const data = await r.json();
+    const tbody = document.getElementById('positions-body');
+    if (!data.length) { tbody.innerHTML = '<tr><td colspan="6" style="color:var(--muted);text-align:center">No open positions</td></tr>'; return; }
+    tbody.innerHTML = data.map(p => `<tr>
+      <td>${p.symbol}</td>
+      <td style="color:${p.side==='long'?'var(--green)':'var(--red)'}">${p.side.toUpperCase()}</td>
+      <td>${p.quantity.toFixed(6)}</td>
+      <td>${p.entry_price.toFixed(2)}</td>
+      <td style="color:var(--yellow)">${p.stop_price.toFixed(2)}</td>
+      <td>${p.bars_held}</td>
+    </tr>`).join('');
+  }
+
+  async function fetchSignals() {
+    const r = await fetch('/api/signals'); const data = await r.json();
+    const tbody = document.getElementById('signals-body');
+    if (!data.length) { tbody.innerHTML = '<tr><td colspan="6" style="color:var(--muted);text-align:center">No fills yet</td></tr>'; return; }
+    tbody.innerHTML = data.slice(-10).reverse().map(f => `<tr>
+      <td style="color:var(--muted)">${f.timestamp.substring(11,19)}</td>
+      <td>${f.symbol}</td>
+      <td style="color:${f.side==='buy'?'var(--green)':'var(--red)'}">${f.side.toUpperCase()}</td>
+      <td>${f.quantity.toFixed(6)}</td>
+      <td>${f.price.toFixed(2)}</td>
+      <td style="color:${f.realised_pnl>=0?'var(--green)':'var(--red)'}">${f.realised_pnl.toFixed(2)}</td>
+    </tr>`).join('');
+  }
+
+  async function fetchTrades() {
+    const r = await fetch('/api/trades?limit=50'); const data = await r.json();
+    const tbody = document.getElementById('trades-body');
+    if (!data.length) { tbody.innerHTML = '<tr><td colspan="9" style="color:var(--muted);text-align:center">No completed trades</td></tr>'; return; }
+    tbody.innerHTML = data.slice().reverse().map(t => `<tr>
+      <td>${t.symbol}</td>
+      <td style="color:${t.side==='long'?'var(--green)':'var(--red)'}">${t.side.toUpperCase()}</td>
+      <td>${t.entry_price.toFixed(2)}</td>
+      <td>${t.exit_price.toFixed(2)}</td>
+      <td style="color:${t.pnl>=0?'var(--green)':'var(--red)'}">${t.pnl>=0?'+':''}${t.pnl.toFixed(2)}</td>
+      <td style="color:${t.pnl_pct>=0?'var(--green)':'var(--red)'}">${(t.pnl_pct*100).toFixed(2)}%</td>
+      <td>${t.bars_held}</td>
+      <td style="color:var(--muted)">${t.exit_reason}</td>
+      <td style="color:var(--blue)">${t.strategy_id}</td>
+    </tr>`).join('');
+  }
+
+  // ── Kill switch ────────────────────────────────────────────────────────
+  async function killSwitch() {
+    if (!confirm('⚠ KILL SWITCH: This will close ALL open positions at market and halt trading. Confirm?')) return;
+    const r = await fetch('/api/kill', { method: 'POST' });
+    const d = await r.json();
+    alert(`Kill switch activated. ${d.positions_closed} position(s) closed.`);
+  }
+
+  async function resumeTrading() {
+    if (!confirm('Resume trading? New signals will be processed.')) return;
+    await fetch('/api/resume', { method: 'POST' });
+    alert('Trading resumed.');
+  }
+
+  // Poll REST endpoints every 10s
+  setInterval(() => { fetchPositions(); fetchSignals(); fetchTrades(); }, 10000);
+  fetchPositions(); fetchSignals(); fetchTrades();
+</script>
+</body>
+</html>

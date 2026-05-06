@@ -1,0 +1,228 @@
+mode: paper  # backtest | paper | live
+
+symbols:
+  - "BTC/USDT"
+
+timeframes:
+  - "1m"
+  - "5m"
+  - "1h"
+  - "4h"
+  - "1d"
+
+primary_timeframe: "1h"
+
+exchanges:
+  binance:
+    enabled: true
+    sandbox: true  # set false for live trading
+    exchange_id: "binance"
+  bybit:
+    enabled: false              # set true to enable as data fallback / price validation
+    sandbox: true
+    exchange_id: "bybit"
+
+risk:
+  max_risk_per_trade_pct: 0.01      # 1% of equity at risk per trade
+  max_daily_drawdown_pct: 0.05      # 5% — circuit breaker halts all trading
+  max_position_notional_pct: 0.20   # max 20% of equity notional per symbol
+  atr_period: 14
+  atr_stop_multiplier: 2.0
+  max_bars_in_trade: 48
+  min_confidence: 0.55              # signals below this confidence are ignored
+  restricted_assets: []             # e.g. ["LUNA/USDT", "UST/USDT"] — skip entry signals
+
+  sizing_method: "fixed_risk"       # fixed_risk | kelly | volatility_targeted
+
+  kelly:
+    fraction: 0.5                   # half-Kelly multiplier
+
+  volatility_targeted:
+    target_vol_pct: 0.01            # 1% daily portfolio vol target
+
+  advanced:
+    asset_filter:
+      enabled: false
+      min_volume_usd_24h: 1000000   # 24h USD volume floor
+      max_daily_vol_pct: 0.15       # daily HV ceiling (ann. HV / sqrt(365))
+      banned_symbols: []            # e.g. ["LUNA/USDT", "SQUID/USDT"]
+
+    exposure_monitor:
+      enabled: false
+      max_concentration_pct: 0.40   # single position <= 40% of equity
+      max_total_notional_pct: 0.80  # total exposure <= 80% of equity
+      max_portfolio_beta: 2.0       # portfolio BTC-beta ceiling
+      correlation_lookback: 60
+      btc_beta_symbols: {}          # e.g. {ETH/USDT: 0.85, SOL/USDT: 1.10}
+
+    black_swan:
+      enabled: false
+      flash_crash_pct: -0.08        # single-bar return <= -8% triggers flatten
+      volume_spike_multiplier: 5.0  # volume >= 5x rolling mean
+      volume_lookback: 20
+      max_funding_rate_abs: 0.003   # abs(funding_rate) >= 0.3% per 8h
+      stablecoin_depeg_pct: 0.005   # 0.5% from $1.00
+      stablecoin_symbols: []
+
+strategies:
+  directional:
+    enabled: true
+    timeframe: "1h"
+    macd_fast: 12
+    macd_slow: 26
+    macd_signal: 9
+    ema_trend: 200
+    rsi_period: 14
+    rsi_overbought: 70
+    rsi_oversold: 30
+
+  mean_reversion:
+    enabled: false
+    timeframe: "1h"
+    bb_period: 20
+    bb_std: 2.0
+    rsi_period: 14
+    rsi_overbought: 70
+    rsi_oversold: 30
+
+backtesting:
+  fee_maker: 0.001      # 0.1% Binance maker fee
+  fee_taker: 0.001      # 0.1% Binance taker fee
+  slippage_pct: 0.0005  # 0.05% slippage estimate
+  max_fill_pct_of_volume: 0.30  # partial fill cap: max 30% of bar volume
+  initial_capital: 10000.0
+  data_dir: "data/historical"
+
+data:
+  bar_window: 500       # bars retained in rolling DataSnapshot window
+  sqlite_path: "data/privateye.db"
+  poll_interval_seconds: 60  # live data polling interval
+
+dashboard:
+  host: "0.0.0.0"
+  port: 8081
+  ws_push_interval_seconds: 5
+
+alerts:
+  min_level: "INFO"     # CRITICAL | INFO | DEBUG
+  rate_limit_seconds: 60     # min interval between same event-type alerts
+  history_size: 100          # in-memory alert record capacity
+  # Credentials loaded from .env
+
+alt_data:
+  enabled: false                     # set true after running scripts/fetch_alt_data.py
+  funding_rates:
+    enabled: true
+    symbol: "BTC/USDT"
+  fear_greed:
+    enabled: true
+    cache_ttl_hours: 6               # re-fetch if older than 6h
+
+execution:
+  use_twap: false                    # enable TWAP slicing for large orders
+  twap_slices: 4                     # number of equal time slices
+  twap_threshold_usd: 1000           # only TWAP orders above this notional
+  use_fee_optimizer: false           # enable FeeOptimizer in FusionStrategy
+  fee_adjusted_min_return: 0.003     # 0.3% minimum expected return after costs
+  limit_patience_bars: 3             # cancel unfilled limit orders after N bars
+  limit_order_preference: false      # use LIMIT orders when optimizer allows
+
+ml:
+  enabled: false                        # set true after running scripts/train_models.py
+  artifacts_dir: "privateye/models/artifacts"
+  strategy: "fusion"                    # directional | mean_reversion | fusion
+
+  lstm:
+    lookback_bars: 60
+    label_horizon_bars: 5
+    label_threshold: 0.002              # 0.2% minimum return for positive label
+    hidden_size: 256
+    num_layers: 2
+    dropout: 0.2
+    epochs: 50
+    patience: 10
+    batch_size: 64
+    lr: 0.0001
+
+  gbm:
+    n_estimators: 500
+    max_depth: 6
+    learning_rate: 0.05
+    gate_threshold: 0.30                # set below base rate (~0.37) until GBM is retrained with more data
+
+  rl:
+    total_timesteps: 500000
+    n_steps: 2048
+    batch_size: 64
+
+  regime:
+    n_states: 4
+
+  fusion:
+    sharpe_window_trades: 30            # trailing window for per-source Sharpe weighting
+    regime_gate: true                   # suppress directional/MR based on regime
+    gbm_gate: true                      # suppress low-probability signals via GBM
+    gbm_gate_threshold: 0.30
+
+  monte_carlo:
+    enabled: false          # set true to run Monte Carlo after backtest
+    n_simulations: 1000
+    block_size: 20
+    seed: 42                # RNG seed for reproducible results
+
+walk_forward:
+  train_bars: 6048      # ~252 trading days at 1h (adjust per timeframe)
+  test_bars: 1512       # ~63 trading days at 1h
+  step_bars: 1512       # advance by one test window each fold
+  min_train_bars: 500   # skip fold if IS window shorter than this
+  min_test_trades: 5    # flag OOS folds with fewer trades (data quality warning)
+
+optimization:
+  strategy_name: "directional"         # strategy block to override: directional | mean_reversion
+  metric: "sharpe_ratio"               # sharpe_ratio | total_pnl | calmar_ratio
+  min_trades: 5                        # flag combinations with fewer OOS trades
+  param_grid:
+    directional:
+      macd_fast: [8, 10, 12]
+      macd_slow: [22, 26, 30]
+      macd_signal: [7, 9]
+    mean_reversion:
+      bb_period: [15, 20, 25]
+      bb_std: [1.5, 2.0, 2.5]
+      rsi_period: [10, 14]
+
+compliance:
+  jurisdiction: ""              # ISO 3166-1 alpha-2 code: "US" | "CN" | "" (disabled)
+  tax_reporting:
+    enabled: false              # set true to auto-export tax CSV after backtest
+    output_dir: "data/reports"
+    method: "fifo"              # fifo (lifo planned)
+    wash_sale_window_days: 30   # advisory wash-sale detection window
+  sanctions:
+    enabled: true               # always check known sanctioned symbols
+    extra_banned: []            # user-defined additional banned symbols
+
+kfold:
+  n_folds:         5     # number of cross-validation folds
+  purge_bars:      100   # bars before test fold excluded from training
+  embargo_bars:    10    # bars after  test fold excluded from training
+  min_train_bars:  500   # skip fold if training set is too small
+  min_test_trades: 5     # flag folds with too few test trades
+  metric:          "sharpe_ratio"  # sharpe_ratio | total_pnl | calmar_ratio
+
+robustness:
+  online_learning:
+    enabled: false
+    buffer_bars: 2000            # rolling bar buffer per symbol/timeframe
+    retrain_every_bars: 200      # new bars between retrain triggers
+    models: [gbm, lstm, regime]  # rl excluded by default (slow to retrain)
+    validation_gate: true        # new model must not regress val_loss > 10%
+    max_val_loss_regression: 0.10
+
+  self_healing:
+    auto_recovery_seconds: 1800  # 30 min before auto-reset probe
+    health_publish_interval_seconds: 60
+
+  shadow_trading:
+    enabled: false
+    divergence_alert_threshold_pct: 2.0

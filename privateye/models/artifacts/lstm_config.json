@@ -1,0 +1,9 @@
+{
+  "lookback": 60,
+  "label_horizon": 5,
+  "label_threshold": 0.002,
+  "hidden_size": 256,
+  "num_layers": 2,
+  "dropout": 0.2,
+  "input_size": 68
+}

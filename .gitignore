@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+
+# Environment / secrets
+.env
+*.env.local
+
+# Data (can be large)
+data/historical/
+data/tick/
+*.db
+*.sqlite
+
+# Models (rebuilt from training)
+models/saved/
+*.pt
+*.pkl
+*.joblib
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

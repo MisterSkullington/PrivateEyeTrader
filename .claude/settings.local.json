@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/ -v --tb=short)",
+      "Bash(python -c ' *)",
+      "Bash(python scripts/backtest.py --strategy fusion --symbol BTC/USDT --tf 1h)",
+      "Bash(python -m pytest tests/test_robustness.py -v)"
+    ]
+  }
+}
