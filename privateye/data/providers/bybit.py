@@ -123,6 +123,10 @@ class BybitProvider:
                 self._consecutive_failures = 0
                 self._success_count += 1
                 self._last_fetch_latency_ms = (time.monotonic() - t0) * 1000
+                log.debug(
+                    f"[BybitProvider] Fetched {symbol} {timeframe}: "
+                    f"{len(df)} closed bars in {self._last_fetch_latency_ms:.0f}ms"
+                )
                 return df
 
             except (ccxt.NetworkError, ccxt.ExchangeNotAvailable, ccxt.RequestTimeout) as e:

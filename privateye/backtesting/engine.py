@@ -144,7 +144,19 @@ class BacktestEngine:
                         )
                         if approved and order:
                             self.exchange.submit_order(order)
-                            self.exchange.process_bar(symbol, bar)
+                            # Hotfix 2026-05-07: capture exit fills and notify
+                            # the originating strategy. Without this on_fill
+                            # call, the strategy's internal position tracker
+                            # never closes — every subsequent bar's on_bar_end
+                            # re-emits a stale exit signal (rejected as
+                            # "Signal rejected: exit"), and bars_held keeps
+                            # growing. The line-128 process_bar already does
+                            # this for entry fills; this mirrors it for exits.
+                            exit_fills = self.exchange.process_bar(symbol, bar)
+                            for fill in exit_fills:
+                                for s in self.strategies:
+                                    if s.strategy_id == fill.strategy_id:
+                                        s.on_fill(fill, portfolio)
 
             equity_curve.append(self.exchange.equity)
 

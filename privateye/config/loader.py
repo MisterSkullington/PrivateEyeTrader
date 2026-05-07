@@ -42,19 +42,39 @@ def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
     return cfg
 
 
+_ALLOWED_MODES = frozenset({
+    "backtest", "paper", "live",
+    # Phase 6 — robustness modes
+    "shadow",
+    # Phase 8/10/11 — validation modes
+    "walk_forward", "optimize", "kfold",
+})
+
+
 def _validate_config(cfg: dict[str, Any]) -> None:
     warnings: list[str] = []
 
     mode = cfg.get("mode", "paper")
-    if mode not in ("backtest", "paper", "live"):
-        raise ConfigError(f"mode must be backtest|paper|live, got: {mode!r}")
+    if mode not in _ALLOWED_MODES:
+        allowed = "|".join(sorted(_ALLOWED_MODES))
+        raise ConfigError(f"mode must be one of {allowed}, got: {mode!r}")
 
     if mode == "live":
-        binance = cfg.get("exchanges", {}).get("binance", {})
-        if not binance.get("api_key"):
-            warnings.append("BINANCE_API_KEY not set — live mode will fail")
-        if binance.get("sandbox", True):
-            warnings.append("exchanges.binance.sandbox=true while mode=live — using sandbox for live")
+        # Phase 13 (C-5): inspect every enabled exchange, not hardcoded Binance
+        enabled_exchanges = [
+            (name, ex) for name, ex in cfg.get("exchanges", {}).items()
+            if isinstance(ex, dict) and ex.get("enabled", False)
+        ]
+        if len(enabled_exchanges) == 0:
+            warnings.append("Live mode but no exchange enabled")
+        elif len(enabled_exchanges) > 1:
+            names = [n for n, _ in enabled_exchanges]
+            warnings.append(f"Live mode with multiple enabled exchanges: {names} — only one is supported")
+        for name, ex in enabled_exchanges:
+            if not ex.get("api_key"):
+                warnings.append(f"{name.upper()}_API_KEY not set — live mode will fail")
+            if ex.get("sandbox", True):
+                warnings.append(f"exchanges.{name}.sandbox=true while mode=live — will be forced to paper mode")
 
     risk = cfg.get("risk", {})
     if risk.get("max_risk_per_trade_pct", 0.01) > 0.05:

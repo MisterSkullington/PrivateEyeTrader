@@ -8,6 +8,7 @@ Models:
   - Market orders fill at close + slippage of the bar they are submitted on
   - Limit orders fill when bar crosses the limit price (no slippage, maker fee)
   - Unfilled limit orders are re-queued up to limit_patience_bars then cancelled
+  - LONG and SHORT positions both supported (Phase 13)
 """
 from __future__ import annotations
 
@@ -16,6 +17,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+import pandas as pd
+
 from privateye.core.types import (
     Direction, Fill, Order, OrderSide, OrderStatus, OrderType,
     PortfolioState, Position, TradeRecord,
@@ -23,6 +26,43 @@ from privateye.core.types import (
 from privateye.utils.logging import get_logger
 
 log = get_logger()
+
+
+def _bar_date_iso(ts: Any) -> str:
+    """Return ISO date string ('YYYY-MM-DD') for a bar timestamp of any common type.
+
+    Robust to:
+      • datetime / pd.Timestamp (uses .date())
+      • int/float epoch seconds (treated as seconds when < 1e10, else milliseconds)
+      • ISO strings (parsed)
+      • Anything else falls back to str()[:10] (legacy behaviour)
+
+    Phase 13 fix for H-4: previous code did ``str(ts)[:10]`` which silently
+    bucketed integer-millisecond timestamps into a single "date" forever
+    (e.g. 1718460000000 → "1718460000"), preventing the daily-drawdown reset
+    from ever firing.
+    """
+    if ts is None or ts == "":
+        return ""
+    if isinstance(ts, (int, float)):
+        # Heuristic: > 1e10 → milliseconds; otherwise seconds
+        if ts > 1e10:
+            ts = ts / 1000.0
+        try:
+            return datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
+        except (OSError, OverflowError, ValueError):
+            return ""
+    if isinstance(ts, datetime):
+        return ts.date().isoformat()
+    if isinstance(ts, pd.Timestamp):
+        return ts.date().isoformat()
+    if isinstance(ts, str):
+        # Try pandas first (handles ISO with TZ, ms-resolution, etc.)
+        try:
+            return pd.Timestamp(ts).date().isoformat()
+        except (ValueError, TypeError):
+            return ts[:10]
+    return str(ts)[:10]
 
 
 class SimulatedExchange:
@@ -73,7 +113,7 @@ class SimulatedExchange:
         Process all pending orders for a symbol against the current bar.
         Returns list of fills generated this bar.
         """
-        bar_date = str(bar.get("timestamp", ""))[:10]
+        bar_date = _bar_date_iso(bar.get("timestamp"))
         if bar_date != self._last_date:
             self.daily_start_equity = self.equity
             self.daily_pnl = 0.0
@@ -181,17 +221,61 @@ class SimulatedExchange:
         )
 
     def _apply_fill(self, fill: Fill, order: Order) -> None:
+        """Apply *fill* to the portfolio.
+
+        Phase 13 changes:
+          • SHORT entry on SELL when no existing position
+          • SHORT close on BUY when an existing SHORT position exists
+          • Entry fees tracked on Position.entry_fees and combined into
+            TradeRecord.fees at close (was previously under-reported by ~50%)
+          • SHORT realised PnL = (entry - exit) × qty − total_fees
+        """
         order.status = OrderStatus.FILLED
         order.filled_quantity = fill.quantity
         order.average_fill_price = fill.price
 
         symbol = fill.symbol
+        existing = self.positions.get(symbol)
+
         if fill.side == OrderSide.BUY:
+            # ── BUY ────────────────────────────────────────────────────────────
+            if existing is not None and existing.side == Direction.SHORT:
+                # CLOSE SHORT — buyer pays cash, gets short release back
+                total_fees = existing.entry_fees + fill.fee
+                realised_pnl = (existing.entry_price - fill.price) * fill.quantity - total_fees
+                # cash impact: receive 2*entry - exit (i.e. release short proceeds + pnl)
+                self.cash += (2.0 * existing.entry_price - fill.price) * fill.quantity - fill.fee
+                fill.realised_pnl = realised_pnl
+                self.daily_pnl += realised_pnl
+                trade = TradeRecord(
+                    symbol=symbol,
+                    side=Direction.SHORT,
+                    entry_price=existing.entry_price,
+                    exit_price=fill.price,
+                    quantity=fill.quantity,
+                    entry_time=existing.entry_time,
+                    exit_time=fill.timestamp,
+                    pnl=realised_pnl,
+                    pnl_pct=realised_pnl / (existing.entry_price * fill.quantity)
+                            if existing.entry_price > 0 else 0.0,
+                    fees=total_fees,
+                    strategy_id=fill.strategy_id,
+                    exit_reason=order.strategy_id,
+                    bars_held=existing.bars_held,
+                )
+                self.trade_records.append(trade)
+                if fill.quantity >= existing.quantity * 0.95:
+                    del self.positions[symbol]
+                else:
+                    existing.quantity -= fill.quantity
+                return
+
+            # OPEN LONG (or pyramid — risk manager normally prevents)
             cost = fill.quantity * fill.price + fill.fee
             if cost > self.cash:
                 log.warning(f"Overspend on fill — capping. cost={cost:.2f} cash={self.cash:.2f}")
             self.cash = max(0.0, self.cash - cost)
-            if symbol not in self.positions:
+            if existing is None:
                 self.positions[symbol] = Position(
                     symbol=symbol,
                     side=Direction.LONG,
@@ -201,38 +285,66 @@ class SimulatedExchange:
                     target_price=0.0,
                     strategy_id=fill.strategy_id,
                     entry_time=fill.timestamp,
+                    entry_fees=fill.fee,
                 )
-        else:  # SELL
-            pos = self.positions.get(symbol)
-            if pos and pos.side == Direction.LONG:
-                realised_pnl = (fill.price - pos.entry_price) * fill.quantity - fill.fee
+
+        else:
+            # ── SELL ───────────────────────────────────────────────────────────
+            if existing is not None and existing.side == Direction.LONG:
+                # CLOSE LONG
+                total_fees = existing.entry_fees + fill.fee
+                realised_pnl = (fill.price - existing.entry_price) * fill.quantity - total_fees
                 self.cash += fill.quantity * fill.price - fill.fee
                 fill.realised_pnl = realised_pnl
                 self.daily_pnl += realised_pnl
                 trade = TradeRecord(
                     symbol=symbol,
                     side=Direction.LONG,
-                    entry_price=pos.entry_price,
+                    entry_price=existing.entry_price,
                     exit_price=fill.price,
                     quantity=fill.quantity,
-                    entry_time=pos.entry_time,
+                    entry_time=existing.entry_time,
                     exit_time=fill.timestamp,
                     pnl=realised_pnl,
-                    pnl_pct=realised_pnl / (pos.entry_price * fill.quantity),
-                    fees=fill.fee,
+                    pnl_pct=realised_pnl / (existing.entry_price * fill.quantity)
+                            if existing.entry_price > 0 else 0.0,
+                    fees=total_fees,
                     strategy_id=fill.strategy_id,
                     exit_reason=order.strategy_id,
-                    bars_held=pos.bars_held,
+                    bars_held=existing.bars_held,
                 )
                 self.trade_records.append(trade)
-                if fill.quantity >= pos.quantity * 0.95:
+                if fill.quantity >= existing.quantity * 0.95:
                     del self.positions[symbol]
                 else:
-                    pos.quantity -= fill.quantity
+                    existing.quantity -= fill.quantity
+                return
+
+            # OPEN SHORT — proceeds added to cash, position recorded with side=SHORT
+            if existing is None:
+                self.cash += fill.quantity * fill.price - fill.fee
+                self.positions[symbol] = Position(
+                    symbol=symbol,
+                    side=Direction.SHORT,
+                    quantity=fill.quantity,
+                    entry_price=fill.price,
+                    stop_price=order.stop_price,
+                    target_price=0.0,
+                    strategy_id=fill.strategy_id,
+                    entry_time=fill.timestamp,
+                    entry_fees=fill.fee,
+                )
 
     def _update_equity(self, symbol: str, current_price: float) -> None:
+        """Mark positions to market; SHORT gains when price falls."""
+        def _value(p: Position, price: float) -> float:
+            if p.side == Direction.LONG:
+                return p.quantity * price
+            # SHORT: equity contribution = entry + (entry - current) = 2*entry - current
+            return p.quantity * (2.0 * p.entry_price - price)
+
         pos_value = sum(
-            p.quantity * current_price if s == symbol else p.quantity * p.entry_price
+            _value(p, current_price if s == symbol else p.entry_price)
             for s, p in self.positions.items()
         )
         self.equity = self.cash + pos_value

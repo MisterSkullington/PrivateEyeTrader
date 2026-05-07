@@ -74,7 +74,13 @@ class OnlineLearner:
     # ── Public interface ──────────────────────────────────────────────────────
 
     async def on_market_data(self, payload: DataSnapshot) -> None:
-        """Append latest bar to the rolling buffer; schedule retrain when due."""
+        """Append latest bar to the rolling buffer; schedule retrain when due.
+
+        Phase 13 (H-10): the counter is reset *before* spawning the retrain
+        task. Previously the reset happened inside ``_run_retrain`` after the
+        task was already created, leaving a window where two consecutive bars
+        could both pass the trigger check and queue duplicate retrains.
+        """
         if not self.enabled:
             return
         if not hasattr(payload, "bars") or len(payload.bars) == 0:
@@ -83,21 +89,35 @@ class OnlineLearner:
         self._buffer.append(payload.bars.iloc[-1].to_dict())
         self._bars_since_retrain += 1
 
+        # Heartbeat: visibility into buffer growth without per-bar spam.
+        # Fires at 25/50/75/100% of the retrain window.
+        heartbeat = max(1, self._retrain_every // 4)
+        if self._bars_since_retrain % heartbeat == 0:
+            log.debug(
+                f"[OnlineLearner] Buffer {len(self._buffer)}/{self._buffer_size}, "
+                f"retrain in {max(0, self._retrain_every - self._bars_since_retrain)} bars"
+            )
+
         if (
             self._bars_since_retrain >= self._retrain_every
             and not self._retrain_lock.locked()
         ):
+            # H-10: reset *before* task creation; prevents duplicate retrains
+            # if a bar arrives between this check and the lock acquisition.
+            self._bars_since_retrain = 0
             asyncio.create_task(self._run_retrain())
 
     # ── Retrain orchestrator ──────────────────────────────────────────────────
 
     async def _run_retrain(self) -> None:
-        """Acquire lock, retrain all configured models, publish MODEL_UPDATED event."""
+        """Acquire lock, retrain all configured models, publish MODEL_UPDATED event.
+
+        Phase 13 (H-10): the counter reset moved up to ``on_market_data`` so it
+        happens atomically with task creation. This method no longer touches it.
+        """
         if self._retrain_lock.locked():
             return
         async with self._retrain_lock:
-            self._bars_since_retrain = 0
-
             if len(self._buffer) < _MIN_BUFFER_ROWS:
                 log.warning(
                     f"[OnlineLearner] Buffer only {len(self._buffer)} rows — "
@@ -224,6 +244,7 @@ class OnlineLearner:
                 pass
 
         # Full retrain
+        # Phase 13 (M-2): use_label_encoder was removed in xgboost 2.1+
         new_clf = xgb.XGBClassifier(
             n_estimators=gbm.n_estimators,
             max_depth=gbm.max_depth,
@@ -232,7 +253,6 @@ class OnlineLearner:
             colsample_bytree=0.8,
             eval_metric="logloss",
             early_stopping_rounds=50,
-            use_label_encoder=False,
             random_state=42,
             verbosity=0,
         )

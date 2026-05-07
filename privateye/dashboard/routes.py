@@ -6,11 +6,12 @@ import json
 from datetime import datetime
 from typing import Any, Callable
 
-from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from pathlib import Path
 
+from privateye.dashboard.auth import require_api_key
 from privateye.utils.logging import get_logger
 
 log = get_logger()
@@ -32,6 +33,12 @@ def build_router(
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     _ws_clients: list[WebSocket] = []
 
+    # Phase 13 (C-4): all /api/* endpoints require X-API-Key when
+    # DASHBOARD_API_KEY env var is set.  WS endpoint and the HTML page (/)
+    # are intentionally public so the dashboard loads without auth headers
+    # — once loaded, the page's JS sends the key with subsequent fetches.
+    _auth = [Depends(require_api_key)]
+
     # ── Pages ───────────────────────────────────────────────────────────────
 
     @router.get("/", response_class=HTMLResponse)
@@ -40,7 +47,7 @@ def build_router(
 
     # ── REST API ────────────────────────────────────────────────────────────
 
-    @router.get("/api/portfolio")
+    @router.get("/api/portfolio", dependencies=_auth)
     async def api_portfolio():
         p = get_portfolio()
         return {
@@ -56,7 +63,7 @@ def build_router(
             "halted": risk_manager.is_halted(),
         }
 
-    @router.get("/api/positions")
+    @router.get("/api/positions", dependencies=_auth)
     async def api_positions():
         p = get_portfolio()
         return [
@@ -74,7 +81,7 @@ def build_router(
             for pos in p.positions.values()
         ]
 
-    @router.get("/api/trades")
+    @router.get("/api/trades", dependencies=_auth)
     async def api_trades(limit: int = 100):
         trades = get_trades()
         recent = trades[-limit:] if len(trades) > limit else trades
@@ -97,7 +104,7 @@ def build_router(
             for t in recent
         ]
 
-    @router.get("/api/metrics")
+    @router.get("/api/metrics", dependencies=_auth)
     async def api_metrics():
         trades = get_trades()
         if not trades:
@@ -116,7 +123,7 @@ def build_router(
             "avg_loss": report.avg_loss,
         }
 
-    @router.get("/api/signals")
+    @router.get("/api/signals", dependencies=_auth)
     async def api_signals():
         fills = get_fills()
         recent = fills[-50:] if len(fills) > 50 else fills
@@ -134,7 +141,7 @@ def build_router(
             for f in recent
         ]
 
-    @router.get("/api/status")
+    @router.get("/api/status", dependencies=_auth)
     async def api_status():
         return {
             "halted": risk_manager.is_halted(),
@@ -144,7 +151,7 @@ def build_router(
 
     # ── Equity / drawdown curves ────────────────────────────────────────────
 
-    @router.get("/api/equity-curve")
+    @router.get("/api/equity-curve", dependencies=_auth)
     async def api_equity_curve():
         """
         Cumulative equity curve computed from completed trades.
@@ -167,7 +174,7 @@ def build_router(
             })
         return curve
 
-    @router.get("/api/drawdown-curve")
+    @router.get("/api/drawdown-curve", dependencies=_auth)
     async def api_drawdown_curve():
         """
         Drawdown curve relative to the running equity peak.
@@ -195,7 +202,7 @@ def build_router(
 
     # ── Alerts history ──────────────────────────────────────────────────────
 
-    @router.get("/api/alerts")
+    @router.get("/api/alerts", dependencies=_auth)
     async def api_alerts(limit: int = 50):
         """
         Recent alert history, newest first.
@@ -218,7 +225,7 @@ def build_router(
 
     # ── Compliance status ───────────────────────────────────────────────────
 
-    @router.get("/api/compliance")
+    @router.get("/api/compliance", dependencies=_auth)
     async def api_compliance():
         """
         Current compliance status: jurisdiction, sanctions setting, blocked
@@ -240,7 +247,7 @@ def build_router(
 
     # ── Kill switch ─────────────────────────────────────────────────────────
 
-    @router.post("/api/kill")
+    @router.post("/api/kill", dependencies=_auth)
     async def api_kill():
         log.critical("[Dashboard] Kill switch activated via API")
         p = get_portfolio()
@@ -250,7 +257,7 @@ def build_router(
         await _broadcast({"event": "kill", "message": "Kill switch activated — all positions closed"})
         return {"status": "kill_switch_activated", "positions_closed": len(p.positions)}
 
-    @router.post("/api/resume")
+    @router.post("/api/resume", dependencies=_auth)
     async def api_resume():
         exec_engine.resume()
         risk_manager.resume()

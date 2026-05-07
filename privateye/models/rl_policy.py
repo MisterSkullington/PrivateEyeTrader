@@ -115,6 +115,13 @@ class RLPolicy(BaseModel):
         # Map SHORT to FLAT (exchange doesn't support shorts yet)
         if direction == "short":
             direction = "flat"
+        # Map HOLD to FLAT with zero confidence — RL is abstaining this bar,
+        # not voting to flatten existing positions. Without this, "hold" leaks
+        # downstream into Direction("hold") which raises ValueError and crashes
+        # the FusionStrategy MARKET_DATA handler.
+        elif direction == "hold":
+            direction = "flat"
+            confidence = 0.0
 
         return direction, float(confidence)
 
@@ -124,9 +131,13 @@ class RLPolicy(BaseModel):
         _require_sb3()
         action_int, _ = self._model.predict(obs, deterministic=False)
         direction = ACTIONS[int(action_int)]
+        confidence = self._action_confidence(obs)
         if direction == "short":
             direction = "flat"
-        return direction, self._action_confidence(obs)
+        elif direction == "hold":
+            direction = "flat"
+            confidence = 0.0
+        return direction, confidence
 
     def _action_confidence(self, obs: np.ndarray) -> float:
         """Confidence = 1 − normalised_entropy of the action distribution."""

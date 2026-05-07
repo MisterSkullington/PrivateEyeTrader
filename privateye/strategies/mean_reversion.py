@@ -55,6 +55,12 @@ class MeanReversionStrategy(AbstractStrategy):
         return [signal] if signal else []
 
     def on_bar_end(self, snapshot: DataSnapshot, portfolio: Any) -> list[TradingSignal]:
+        # Hotfix 2026-05-07: timeframe guard — on_bar_end must not run on
+        # non-target timeframes, otherwise bars_held inflates 5× per poll and
+        # exit conditions are checked against stale closes from other timeframes
+        # (e.g. yesterday's 1d close incorrectly tripping the stop).
+        if snapshot.timeframe != self.timeframe:
+            return []
         if not self._has_position(snapshot.symbol):
             return []
         pos = self._get_position(snapshot.symbol)
@@ -62,21 +68,27 @@ class MeanReversionStrategy(AbstractStrategy):
         close = snapshot.close
         pos.bars_held += 1
 
+        # Hotfix 2026-05-07 (Option B): skip exit checks on the entry bar
+        # (bars_held == 1). The bar's close already has the entry baked in,
+        # but stop/target levels were computed from the same close — a bar
+        # whose intra-bar move trips them would mis-fire if checked now.
+        # See directional.py:on_bar_end for the full rationale.
         exit_reason = None
-        if pos.side == Direction.LONG:
-            if close >= pos.target_price:
-                exit_reason = "target"
-            elif close <= pos.stop_price:
-                exit_reason = "stop"
-            elif pos.bars_held >= self.max_bars:
-                exit_reason = "timeout"
-        else:  # SHORT
-            if close <= pos.target_price:
-                exit_reason = "target"
-            elif close >= pos.stop_price:
-                exit_reason = "stop"
-            elif pos.bars_held >= self.max_bars:
-                exit_reason = "timeout"
+        if pos.bars_held > 1:
+            if pos.side == Direction.LONG:
+                if close >= pos.target_price:
+                    exit_reason = "target"
+                elif close <= pos.stop_price:
+                    exit_reason = "stop"
+                elif pos.bars_held >= self.max_bars:
+                    exit_reason = "timeout"
+            else:  # SHORT
+                if close <= pos.target_price:
+                    exit_reason = "target"
+                elif close >= pos.stop_price:
+                    exit_reason = "stop"
+                elif pos.bars_held >= self.max_bars:
+                    exit_reason = "timeout"
 
         if exit_reason:
             return [self._flat_signal(snapshot, exit_reason)]

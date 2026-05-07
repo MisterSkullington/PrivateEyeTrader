@@ -15,7 +15,7 @@ primary_timeframe: "1h"
 exchanges:
   binance:
     enabled: true
-    sandbox: true  # set false for live trading
+    sandbox: false  # MAINNET data feed (paper mode still simulates fills locally via SimulatedExchange)
     exchange_id: "binance"
   bybit:
     enabled: false              # set true to enable as data fallback / price validation
@@ -99,9 +99,10 @@ data:
   poll_interval_seconds: 60  # live data polling interval
 
 dashboard:
-  host: "0.0.0.0"
+  host: "127.0.0.1"          # Phase 13 (C-4): loopback only by default; change to "0.0.0.0" intentionally for LAN/Docker access
   port: 8081
   ws_push_interval_seconds: 5
+  require_auth: true         # Phase 13 (C-4): when true, env DASHBOARD_API_KEY must be set in live mode
 
 alerts:
   min_level: "INFO"     # CRITICAL | INFO | DEBUG
@@ -128,7 +129,7 @@ execution:
   limit_order_preference: false      # use LIMIT orders when optimizer allows
 
 ml:
-  enabled: false                        # set true after running scripts/train_models.py
+  enabled: true                         # FusionStrategy active — uses GBM + LSTM + regime gates
   artifacts_dir: "privateye/models/artifacts"
   strategy: "fusion"                    # directional | mean_reversion | fusion
 
@@ -212,7 +213,7 @@ kfold:
 
 robustness:
   online_learning:
-    enabled: false
+    enabled: true                # incremental retrain every retrain_every_bars new MARKET_DATA bars
     buffer_bars: 2000            # rolling bar buffer per symbol/timeframe
     retrain_every_bars: 200      # new bars between retrain triggers
     models: [gbm, lstm, regime]  # rl excluded by default (slow to retrain)

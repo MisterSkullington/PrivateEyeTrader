@@ -56,6 +56,11 @@ class DataPipeline:
             timestamp=now_utc(),
         )
         await self.bus.publish(EventType.MARKET_DATA, snapshot)
+        log.debug(
+            f"[DataPipeline] Published MARKET_DATA {symbol} {timeframe}: "
+            f"window={len(combined)} bars, latest_close="
+            f"{float(combined['close'].iloc[-1]):.2f}"
+        )
 
     async def push_bar(self, symbol: str, timeframe: str, bar: dict[str, Any]) -> None:
         """Push a single bar dict."""

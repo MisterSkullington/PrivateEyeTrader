@@ -9,9 +9,21 @@ Exit logic:
   Trailing stop (2×ATR from highest close since entry for longs, lowest for shorts)
   OR max_bars_in_trade timeout
   OR opposing MACD signal (optional)
+
+Phase 13 audit fixes:
+  • H-3: ``on_fill`` mirrors the simulator's Position (with the real stop_price
+    from the originating order) instead of fabricating a 1% ATR estimate.
+    Also adds SHORT tracking which was previously absent.
+  • H-8: ``on_bar_end`` uses an explicit ``if pos is None`` guard instead of
+    ``assert``, which is stripped under ``python -O``.
+  • H-9: Trailing stop fires when the bar's ``low`` (for LONG) or ``high``
+    (for SHORT) crosses the stop level — not the close. Previously, a bar
+    that pierced the stop intra-bar but recovered to close above it would
+    not exit in backtest, systematically over-reporting performance.
 """
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import pandas as pd
@@ -68,14 +80,27 @@ class DirectionalStrategy(AbstractStrategy):
         return signals
 
     def on_bar_end(self, snapshot: DataSnapshot, portfolio: Any) -> list[TradingSignal]:
+        # Hotfix 2026-05-07: on_bar_end must filter by timeframe like on_data does.
+        # Without this filter, the bus dispatches MARKET_DATA for every configured
+        # timeframe (1m/5m/1h/4h/1d) per poll cycle, so each poll runs the exit
+        # logic 5 times — inflating bars_held, recomputing trailing_stop with the
+        # wrong ATR, and (worst) checking stops against stale closes from non-1h
+        # timeframes (the 1d close is yesterday's daily, sometimes below stop).
+        if snapshot.timeframe != self.timeframe:
+            return []
         if not self._has_position(snapshot.symbol):
             return []
         pos = self._get_position(snapshot.symbol)
-        assert pos is not None
-        close = snapshot.close
+        if pos is None:                                     # H-8: explicit guard
+            return []
+
+        last_bar = snapshot.bars.iloc[-1]
+        close = float(last_bar["close"])
+        bar_low = float(last_bar["low"])
+        bar_high = float(last_bar["high"])
         signals: list[TradingSignal] = []
 
-        # Update trailing stop extreme
+        # Update trailing stop extreme + check exit
         if pos.side == Direction.LONG:
             self._extremes[snapshot.symbol] = max(
                 self._extremes.get(snapshot.symbol, close), close
@@ -86,14 +111,22 @@ class DirectionalStrategy(AbstractStrategy):
             new_stop = trail_ref - self.atr_stop_mult * a
             pos.trailing_stop = max(pos.trailing_stop, new_stop)
             pos.bars_held += 1
-            # Check stops
+
+            # H-9: stop fires when bar.low pierces the level (not just close).
+            # Hotfix 2026-05-07 (Option B): skip exit checks on the entry bar
+            # (bars_held == 1). The trailing_stop is still armed/updated above —
+            # we only suppress the comparison against bar_low/bar_high/target on
+            # the bar where the position was just opened, because those values
+            # pre-date the fill and would otherwise trigger an immediate exit
+            # on any bar whose range exceeds the ATR-stop distance.
             exit_reason = None
-            if close <= pos.trailing_stop:
-                exit_reason = "trailing_stop"
-            elif pos.bars_held >= self.max_bars:
-                exit_reason = "timeout"
-            elif close >= pos.target_price:
-                exit_reason = "target"
+            if pos.bars_held > 1:
+                if bar_low <= pos.trailing_stop:
+                    exit_reason = "trailing_stop"
+                elif pos.bars_held >= self.max_bars:
+                    exit_reason = "timeout"
+                elif bar_high >= pos.target_price > 0:
+                    exit_reason = "target"
         else:  # SHORT
             self._extremes[snapshot.symbol] = min(
                 self._extremes.get(snapshot.symbol, close), close
@@ -106,13 +139,17 @@ class DirectionalStrategy(AbstractStrategy):
                 pos.trailing_stop if pos.trailing_stop > 0 else new_stop, new_stop
             )
             pos.bars_held += 1
+
+            # H-9: short stop fires when bar.high crosses up through the level.
+            # See LONG branch above for the bars_held>1 rationale.
             exit_reason = None
-            if close >= pos.trailing_stop:
-                exit_reason = "trailing_stop"
-            elif pos.bars_held >= self.max_bars:
-                exit_reason = "timeout"
-            elif close <= pos.target_price:
-                exit_reason = "target"
+            if pos.bars_held > 1:
+                if bar_high >= pos.trailing_stop > 0:
+                    exit_reason = "trailing_stop"
+                elif pos.bars_held >= self.max_bars:
+                    exit_reason = "timeout"
+                elif bar_low <= pos.target_price and pos.target_price > 0:
+                    exit_reason = "target"
 
         if exit_reason:
             signals.append(self._flat_signal(snapshot, exit_reason))
@@ -229,25 +266,63 @@ class DirectionalStrategy(AbstractStrategy):
         return min(score, 1.0)
 
     def on_fill(self, fill: Any, portfolio: Any) -> None:
+        """Mirror the simulator's authoritative Position into the strategy tracker.
+
+        Phase 13 (H-3): we used to fabricate stop/target from a 1% ATR estimate
+        because the original signal's ATR wasn't available at fill time. Now we
+        copy the Position the simulator already built (which carries the real
+        ``stop_price`` and ``target_price`` from the originating Order).
+
+        Also adds SHORT tracking — previously a SELL fill with no existing
+        long was a no-op, leaving the strategy unaware of the open short.
+        """
         from privateye.core.types import Direction, OrderSide
-        if fill.side == OrderSide.BUY:
-            side = Direction.LONG
-        else:
-            side = Direction.SHORT
+
         symbol = fill.symbol
-        if fill.side == OrderSide.BUY and not self._has_position(symbol):
-            # Opening a long
-            atr_est = fill.price * 0.01
-            pos = Position(
-                symbol=symbol, side=side, quantity=fill.quantity,
-                entry_price=fill.price,
-                stop_price=fill.price - self.atr_stop_mult * atr_est,
-                target_price=fill.price + self.atr_target_mult * atr_est,
-                strategy_id=self.strategy_id,
-            )
-            pos.trailing_stop = pos.stop_price
-            self._open_position(symbol, pos)
-            self._extremes[symbol] = fill.price
-        elif fill.side == OrderSide.SELL and self._has_position(symbol):
-            self._close_position(symbol)
-            self._extremes.pop(symbol, None)
+        sim_pos = (
+            portfolio.positions.get(symbol)
+            if portfolio is not None and hasattr(portfolio, "positions")
+            else None
+        )
+
+        if fill.side == OrderSide.BUY:
+            # BUY closes an existing SHORT or opens a LONG
+            existing = self._get_position(symbol)
+            if existing is not None and existing.side == Direction.SHORT:
+                self._close_position(symbol)
+                self._extremes.pop(symbol, None)
+                return
+
+            if sim_pos is not None and sim_pos.side == Direction.LONG and not self._has_position(symbol):
+                pos = dataclasses.replace(sim_pos)            # mirror simulator
+                pos.trailing_stop = pos.stop_price             # initialise trail from real stop
+                self._open_position(symbol, pos)
+                self._extremes[symbol] = fill.price
+            elif not self._has_position(symbol):
+                # Fallback: simulator didn't expose the position (e.g. live mode);
+                # fabricate a conservative stop using configured multiplier on a 1% ATR proxy.
+                atr_est = fill.price * 0.01
+                pos = Position(
+                    symbol=symbol, side=Direction.LONG, quantity=fill.quantity,
+                    entry_price=fill.price,
+                    stop_price=fill.price - self.atr_stop_mult * atr_est,
+                    target_price=fill.price + self.atr_target_mult * atr_est,
+                    strategy_id=self.strategy_id,
+                )
+                pos.trailing_stop = pos.stop_price
+                self._open_position(symbol, pos)
+                self._extremes[symbol] = fill.price
+
+        else:  # SELL
+            # SELL closes an existing LONG or opens a SHORT
+            existing = self._get_position(symbol)
+            if existing is not None and existing.side == Direction.LONG:
+                self._close_position(symbol)
+                self._extremes.pop(symbol, None)
+                return
+
+            if sim_pos is not None and sim_pos.side == Direction.SHORT and not self._has_position(symbol):
+                pos = dataclasses.replace(sim_pos)
+                pos.trailing_stop = pos.stop_price
+                self._open_position(symbol, pos)
+                self._extremes[symbol] = fill.price

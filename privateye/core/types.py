@@ -136,6 +136,7 @@ class Position:
     bars_held: int = 0
     unrealised_pnl: float = 0.0
     trailing_stop: float = 0.0
+    entry_fees: float = 0.0       # Phase 13: fee paid to open this position; combined into TradeRecord.fees on close
 
     @property
     def notional(self) -> float:

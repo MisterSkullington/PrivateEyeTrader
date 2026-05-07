@@ -155,15 +155,32 @@ class FusionStrategy(AbstractStrategy):
         return [base]
 
     def on_bar_end(self, snapshot: DataSnapshot, portfolio: Any) -> list[TradingSignal]:
-        # Delegate exit management to the sub-strategies
-        exits: list[TradingSignal] = []
-        exits += self._directional.on_bar_end(snapshot, portfolio)
-        exits += self._mean_reversion.on_bar_end(snapshot, portfolio)
+        # Hotfix 2026-05-07: only delegate exit management to ``_directional``.
+        # MeanReversionStrategy's exit logic uses BB-based stops/targets that
+        # don't reflect the FusionStrategy-computed entry levels, and on every
+        # BUY fill it would open a phantom internal position with placeholder
+        # stop=fill*0.98 / target=fill*1.02 that didn't match the real order.
+        # Since ``_directional.on_fill`` mirrors the simulator's authoritative
+        # Position via ``dataclasses.replace(sim_pos)``, only directional has
+        # the correct stop/target/trailing context to manage the exit.
+        exits = self._directional.on_bar_end(snapshot, portfolio)
+        # Hotfix 2026-05-07 (round-trip): rewrite strategy_id from the
+        # sub-strategy ID ("fusion_directional") to the parent ID ("fusion")
+        # so the resulting fill flows back through FusionStrategy.on_fill.
+        # Without this, the on_fill filter in main.run_paper / backtest engine
+        # (``strategy.strategy_id == fill.strategy_id``) silently drops the
+        # exit fill — directional's internal tracker never closes, bars_held
+        # keeps incrementing, and on_bar_end emits a stale exit signal every
+        # subsequent bar (rejected as "Signal rejected: exit"). The same
+        # mismatch then prevents on_fill from opening the next BUY's tracker,
+        # leading to permanent strategy/simulator state divergence.
+        for s in exits:
+            s.strategy_id = self.STRATEGY_ID
         return exits
 
     def on_fill(self, fill: Any, portfolio: Any) -> None:
+        # Only directional tracks the position — see on_bar_end comment.
         self._directional.on_fill(fill, portfolio)
-        self._mean_reversion.on_fill(fill, portfolio)
         # Record P&L for trailing Sharpe (use realised_pnl from the fill)
         pnl = getattr(fill, "realised_pnl", 0.0)
         if pnl != 0.0:
@@ -172,6 +189,8 @@ class FusionStrategy(AbstractStrategy):
 
     # ── Voting ────────────────────────────────────────────────────────────────
 
+    _VALID_DIRECTIONS = ("long", "short", "flat")
+
     def _weighted_vote(
         self,
         sources: dict[str, tuple[str, float]],
@@ -179,14 +198,32 @@ class FusionStrategy(AbstractStrategy):
     ) -> tuple[str, float]:
         weights = self._compute_weights(list(sources.keys()))
 
+        # Defense-in-depth: any source returning a non-canonical label (e.g. RL
+        # action 3 = "hold") is treated as a no-op contributor. Without this,
+        # an unknown direction would propagate to Direction(direction) and
+        # crash the bus handler. The RLPolicy maps "hold" → ("flat", 0.0) at
+        # source so this filter rarely fires, but keeps any future model
+        # introducing a new label from breaking signal evaluation.
         score: dict[str, float] = {"long": 0.0, "short": 0.0, "flat": 0.0}
         for name, (direction, conf) in sources.items():
+            if direction not in self._VALID_DIRECTIONS:
+                log.debug(
+                    f"[FusionStrategy] {name} returned non-canonical direction "
+                    f"'{direction}' — treating as no-op"
+                )
+                continue
             w = weights.get(name, 1.0)
-            score[direction] = score.get(direction, 0.0) + conf * w
+            score[direction] = score[direction] + conf * w
+
+        total = sum(score.values())
+        if total == 0:
+            # No canonical source contributed — fall to flat with no opinion.
+            # Without this, max() on tied zeros picks "long" (first key) and a
+            # zero-confidence long signal propagates pointlessly downstream.
+            return "flat", 0.0
 
         best_dir = max(score, key=lambda d: score[d])
-        total    = sum(score.values())
-        confidence = score[best_dir] / total if total > 0 else 0.0
+        confidence = score[best_dir] / total
 
         if best_dir != "flat" and not gbm_pass:
             log.debug(f"[FusionStrategy] GBM gate blocked {best_dir} signal.")

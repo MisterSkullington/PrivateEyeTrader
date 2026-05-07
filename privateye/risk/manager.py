@@ -46,6 +46,12 @@ class RiskManager:
         self.max_daily_dd_pct: float = config.get("max_daily_drawdown_pct", 0.05)
         self.max_notional_pct: float = config.get("max_position_notional_pct", 0.20)
         self.min_confidence: float   = config.get("min_confidence", 0.55)
+        # Phase 13 (M-5): cash buffer is configurable. Default 1% (was hardcoded).
+        self.cash_buffer_pct: float  = config.get("cash_buffer_pct", 0.01)
+        # Phase 13 (H-2): SHORT signals on spot exchanges are infeasible by default.
+        # Set ``allow_spot_short: true`` in risk config to override (e.g. with margin).
+        self.allow_spot_short: bool  = config.get("allow_spot_short", False)
+        self.exchange_default_type: str = config.get("exchange_default_type", "spot")
         self._restricted: set[str]   = set(config.get("restricted_assets", []))
         self._halted: bool           = False
         self._halt_reason: str       = ""
@@ -82,6 +88,15 @@ class RiskManager:
         # Gate 2: Restricted assets — block all entry signals
         if signal.symbol in self._restricted:
             return False, f"Asset {signal.symbol} is in restricted_assets list", None
+
+        # Gate 2.5 (H-2): SHORT feasibility — spot exchanges don't support shorts
+        # without a margin account. Reject SHORT signals unless explicitly allowed.
+        if signal.direction == Direction.SHORT:
+            if self.exchange_default_type == "spot" and not self.allow_spot_short:
+                return False, (
+                    "SHORT signal on spot exchange — set risk.allow_spot_short=true "
+                    "or risk.exchange_default_type='margin' to enable"
+                ), None
 
         # Gate 3: Check halt
         if self._halted:
@@ -120,10 +135,14 @@ class RiskManager:
             if not ok:
                 return False, f"ExposureMonitor: {exposure_reason}", None
 
-        # Gate 9: Check cash availability
+        # Gate 9: Check cash availability — M-5: configurable buffer (default 1%)
         required_cash = qty * signal.entry_price
-        if required_cash > portfolio.cash * 0.99:  # 1% buffer
-            return False, f"Insufficient cash: need {required_cash:.2f}, have {portfolio.cash:.2f}", None
+        max_spend = portfolio.cash * (1.0 - self.cash_buffer_pct)
+        if required_cash > max_spend:
+            return False, (
+                f"Insufficient cash: need {required_cash:.2f}, have {portfolio.cash:.2f} "
+                f"(buffer={self.cash_buffer_pct * 100:.1f}%)"
+            ), None
 
         # Gate 10: Check existing position in this symbol
         if signal.symbol in portfolio.positions:
@@ -205,12 +224,14 @@ class RiskManager:
         if not pos:
             return None
         exit_side = OrderSide.SELL if pos.side == Direction.LONG else OrderSide.BUY
+        # M-4: market exits don't have a meaningful limit price — set to 0.0 so
+        # ccxt doesn't validate it and the simulator uses bar.close + slippage.
         return Order(
             symbol=signal.symbol,
             side=exit_side,
             order_type=OrderType.MARKET,
             quantity=pos.quantity,
-            price=signal.entry_price,  # current close
+            price=0.0,
             stop_price=0.0,
             strategy_id=signal.strategy_id,
         )

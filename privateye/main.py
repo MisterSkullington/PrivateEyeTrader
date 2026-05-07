@@ -14,10 +14,45 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from privateye.core.exceptions import ConfigError
 from privateye.utils.logging import setup_logging, get_logger
 
 setup_logging()
 log = get_logger()
+
+
+# ── Phase 13 audit-fix safety flag ────────────────────────────────────────────
+# Set to True only after all Phase 13 audit fixes are merged AND the full test
+# suite is green. Live trading is blocked while this is False.
+# Search the plan file for "Phase 13" for the full punch-list.
+#
+# Flipped True on 2026-05-06 after all 11 Phase 13 audit fixes landed and
+# the full suite reached 457 passing (409 baseline + 48 new tests).
+PHASE13_COMPLETE: bool = True
+
+
+def _active_exchange_name(cfg: dict[str, Any]) -> str:
+    """Return the single exchange enabled for trading.
+
+    Phase 13 (C-5): the sandbox safeguard previously inspected hardcoded
+    ``cfg["exchanges"]["binance"]``, which silently misbehaved when a user
+    enabled a different exchange. Live mode requires exactly one enabled
+    exchange — multiple is ambiguous, zero is a misconfiguration.
+    """
+    enabled = [
+        name for name, ex in cfg.get("exchanges", {}).items()
+        if isinstance(ex, dict) and ex.get("enabled", False)
+    ]
+    if len(enabled) == 0:
+        raise ConfigError(
+            "No exchange enabled. Set exchanges.<name>.enabled=true for at least one."
+        )
+    if len(enabled) > 1:
+        raise ConfigError(
+            f"Live mode requires exactly one enabled exchange, got: {enabled}. "
+            "Disable all but one to proceed."
+        )
+    return enabled[0]
 
 
 def _build_strategies(cfg: dict[str, Any]) -> list:
@@ -441,27 +476,57 @@ async def run_paper(cfg: dict[str, Any]) -> None:
 
 
 async def run_live(cfg: dict[str, Any]) -> None:
-    from privateye.config.loader import get_exchange_config
-    ex_cfg = get_exchange_config(cfg)
+    """Live trading entry point.
+
+    Phase 13 changes:
+      • C-5: Active-exchange sandbox safeguard (was Binance-only)
+      • C-3: Cached portfolio snapshot for dashboard (was async-from-sync crash)
+      • H-6: Removed dead `live_portfolio` variable
+      • PHASE13_COMPLETE flag blocks live trading until full audit fix-set lands
+    """
+    if not PHASE13_COMPLETE:
+        log.critical(
+            "Live mode is disabled until Phase 13 audit fixes are complete. "
+            "Run `pytest tests/ -q` and ensure all 449 tests pass, then flip "
+            "PHASE13_COMPLETE=True in privateye/main.py."
+        )
+        return
+
+    # C-5: Sandbox safeguard inspects the ACTIVE exchange, not hardcoded Binance
+    active_name = _active_exchange_name(cfg)
+    ex_cfg = cfg["exchanges"][active_name]
 
     if ex_cfg.get("sandbox", True):
-        log.warning("LIVE mode but sandbox=true — forcing paper mode for safety")
+        log.warning(
+            f"LIVE mode but {active_name}.sandbox=true — forcing paper mode for safety"
+        )
         await run_paper(cfg)
         return
 
     # Confirm live intent
     if not ex_cfg.get("api_key"):
-        log.error("BINANCE_API_KEY not set. Cannot run live.")
+        log.error(f"{active_name.upper()}_API_KEY not set. Cannot run live.")
         return
 
-    log.critical("LIVE MODE — real orders will be placed on Binance")
+    # C-4: Live mode requires dashboard auth unless explicitly disabled
+    from privateye.dashboard.auth import auth_enabled
+    require_auth = cfg.get("dashboard", {}).get("require_auth", True)
+    if require_auth and not auth_enabled():
+        log.error(
+            "Live mode requires DASHBOARD_API_KEY to be set when "
+            "dashboard.require_auth=true. Generate a key with: "
+            "python -c \"import secrets; print(secrets.token_urlsafe(32))\""
+        )
+        return
+
+    log.critical(f"LIVE MODE — real orders will be placed on {active_name}")
     from privateye.execution.adapter import ExchangeAdapter
     from privateye.core.event_bus import AsyncEventBus
+    from privateye.core.types import EventType, PortfolioState
     from privateye.data.pipeline import DataPipeline
     from privateye.data.providers.binance import BinanceProvider
     from privateye.execution.engine import ExecutionEngine
     from privateye.risk.manager import RiskManager
-    from privateye.core.types import EventType
 
     bus = AsyncEventBus()
     alert_manager = _build_alert_manager(bus, cfg)
@@ -480,7 +545,22 @@ async def run_live(cfg: dict[str, Any]) -> None:
     timeframes = cfg.get("timeframes", ["1h"])
     primary_tf = cfg.get("primary_timeframe", "1h")
     poll_interval = cfg.get("data", {}).get("poll_interval_seconds", 60)
-    live_portfolio: list = []  # mutable container for current state
+    initial_capital = float(cfg.get("backtesting", {}).get("initial_capital", 10000.0))
+
+    # C-3: Cached portfolio snapshot. The dashboard's get_portfolio callback runs
+    # SYNCHRONOUSLY from inside the FastAPI event loop, so it cannot await.
+    # A background task refreshes this dict; the callback returns the latest snapshot.
+    _portfolio_cache: dict[str, PortfolioState] = {
+        "state": PortfolioState(equity=initial_capital, cash=initial_capital)
+    }
+
+    async def _refresh_live_portfolio() -> None:
+        while True:
+            try:
+                _portfolio_cache["state"] = await exec_engine.get_portfolio_state(symbols)
+            except Exception as exc:   # noqa: BLE001 — keep loop alive on any error
+                log.warning(f"[main] Live portfolio refresh failed: {exc}")
+            await asyncio.sleep(5)
 
     async def on_signal(signal: Any) -> None:
         allowed, c_reason = compliance_engine.check_symbol(signal.symbol)
@@ -527,18 +607,17 @@ async def run_live(cfg: dict[str, Any]) -> None:
 
     from privateye.dashboard.server import start_dashboard
     dashboard_cfg = cfg.get("dashboard", {})
+    refresh_task = asyncio.create_task(_refresh_live_portfolio())
     dashboard_task = asyncio.create_task(
         start_dashboard(
-            host=dashboard_cfg.get("host", "0.0.0.0"),
+            host=dashboard_cfg.get("host", "127.0.0.1"),
             port=dashboard_cfg.get("port", 8081),
-            get_portfolio=lambda: asyncio.run(exec_engine.get_portfolio_state(symbols)),
+            get_portfolio=lambda: _portfolio_cache["state"],   # C-3: cached snapshot
             get_trades=lambda: [],
             get_fills=lambda: [],
             exec_engine=exec_engine,
             risk_manager=risk_manager,
-            initial_capital=float(
-                cfg.get("backtesting", {}).get("initial_capital", 10000.0)
-            ),
+            initial_capital=initial_capital,
             get_alerts=alert_manager.get_recent_alerts,
             get_compliance=compliance_engine.get_status,
         )
@@ -552,6 +631,7 @@ async def run_live(cfg: dict[str, Any]) -> None:
     finally:
         provider.stop()
         bus.stop()
+        refresh_task.cancel()
         dashboard_task.cancel()
         bus_task.cancel()
 
