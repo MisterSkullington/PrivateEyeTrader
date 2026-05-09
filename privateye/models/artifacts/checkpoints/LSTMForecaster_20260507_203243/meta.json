@@ -1,0 +1,13 @@
+{
+  "model_name": "LSTMForecaster",
+  "bars_seen": 1600,
+  "saved_at": "2026-05-07T20:32:43.373513+00:00",
+  "artifact_files": [
+    "gbm_classifier.pkl",
+    "gbm_feature_names.json",
+    "lstm_config.json",
+    "lstm_forecaster.pt",
+    "regime_detector.pkl",
+    "rl_policy.zip"
+  ]
+}

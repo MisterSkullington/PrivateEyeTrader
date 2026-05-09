@@ -1,0 +1,13 @@
+{
+  "model_name": "RegimeDetector",
+  "bars_seen": 1800,
+  "saved_at": "2026-05-07T21:13:52.910398+00:00",
+  "artifact_files": [
+    "gbm_classifier.pkl",
+    "gbm_feature_names.json",
+    "lstm_config.json",
+    "lstm_forecaster.pt",
+    "regime_detector.pkl",
+    "rl_policy.zip"
+  ]
+}
