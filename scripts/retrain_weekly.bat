@@ -6,6 +6,7 @@ set PROJECT=E:\Documents\GitHub\PrivateEyeTrader
 set PYTHON=C:\Users\jorda\AppData\Local\Programs\Python\Python313\python.exe
 set LOGDIR=%PROJECT%\logs
 set LOGFILE=%LOGDIR%\retrain_%DATE:~10,4%-%DATE:~4,2%-%DATE:~7,2%.log
+set LOKY_MAX_CPU_COUNT=12
 
 if not exist "%LOGDIR%" mkdir "%LOGDIR%"
 

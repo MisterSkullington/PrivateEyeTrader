@@ -28,6 +28,11 @@ def create_app(
     get_health: Callable | None = None,
     get_alerts: Callable | None = None,
     get_compliance: Callable | None = None,
+    get_execution_stats: Callable | None = None,  # Phase 3
+    # Phase 4
+    get_model_versions: Callable | None = None,
+    get_feedback: Callable | None = None,
+    post_feedback: Callable | None = None,
 ) -> FastAPI:
     global _app
     app = FastAPI(title="PrivateEyeTrader Dashboard", version="1.0.0")
@@ -44,6 +49,10 @@ def create_app(
         get_health=get_health,
         get_alerts=get_alerts,
         get_compliance=get_compliance,
+        get_execution_stats=get_execution_stats,
+        get_model_versions=get_model_versions,
+        get_feedback=get_feedback,
+        post_feedback=post_feedback,
     )
     app.include_router(router)
     _app = app
@@ -62,6 +71,11 @@ async def start_dashboard(
     get_health: Callable | None = None,
     get_alerts: Callable | None = None,
     get_compliance: Callable | None = None,
+    get_execution_stats: Callable | None = None,  # Phase 3
+    # Phase 4
+    get_model_versions: Callable | None = None,
+    get_feedback: Callable | None = None,
+    post_feedback: Callable | None = None,
 ) -> None:
     app = create_app(
         get_portfolio, get_trades, get_fills, exec_engine, risk_manager,
@@ -69,6 +83,10 @@ async def start_dashboard(
         get_health=get_health,
         get_alerts=get_alerts,
         get_compliance=get_compliance,
+        get_execution_stats=get_execution_stats,
+        get_model_versions=get_model_versions,
+        get_feedback=get_feedback,
+        post_feedback=post_feedback,
     )
     config = uvicorn.Config(app, host=host, port=port, log_level="warning", loop="asyncio")
     server = uvicorn.Server(config)

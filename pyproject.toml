@@ -59,6 +59,14 @@ ml = [
     # Persistence
     "joblib>=1.3",
 ]
+phase0 = [
+    # Parquet I/O (faster than CSV for large bar sets)
+    "pyarrow>=14.0",
+    # Experiment tracking
+    "mlflow>=2.12",
+    # Bayesian hyperparameter optimisation
+    "optuna>=3.6",
+]
 
 [project.scripts]
 privateye = "privateye.main:cli"

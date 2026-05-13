@@ -30,6 +30,91 @@ log = get_logger()
 # the full suite reached 457 passing (409 baseline + 48 new tests).
 PHASE13_COMPLETE: bool = True
 
+# Flip True after golden_results_v1.0.json is committed and tagged v1.0-baseline.
+# Run: python scripts/run_golden_suite.py
+PHASE0_COMPLETE: bool = False
+
+# Flipped True 2026-05-13 after MacroProvider, FeatureEngineer, FeatureDriftDetector,
+# live alt-data enrichment, and all 564 tests passed.
+PHASE1_COMPLETE: bool = True
+
+PHASE2_COMPLETE: bool = True
+
+# Flip True after all Phase 3 tests pass and execution-stats endpoint is green.
+PHASE3_COMPLETE: bool = True
+
+# Flip True after all Phase 4 tests pass (654 total).
+PHASE4_COMPLETE: bool = True
+
+# Flip True after all Phase 5 tests pass (684 total).
+PHASE5_COMPLETE: bool = True
+
+
+# ── Phase 3 builder helpers ───────────────────────────────────────────────────
+
+def _build_slippage_predictor(cfg: dict[str, Any]) -> Any:
+    """Build a SlippagePredictor from config.execution.predictive_slippage."""
+    from privateye.execution.slippage_predictor import SlippagePredictor
+    ps_cfg = cfg.get("execution", {}).get("predictive_slippage", {})
+    return SlippagePredictor(
+        alpha=float(ps_cfg.get("alpha", 0.1)),
+        avg_daily_volume_usd=float(ps_cfg.get("avg_daily_volume_usd", 5e8)),
+    )
+
+
+def _build_smart_order_router(cfg: dict[str, Any], predictor: Any) -> Any | None:
+    """Build SmartOrderRouter when config.execution.smart_routing.enabled is true."""
+    from privateye.execution.smart_order_router import SmartOrderRouter
+    sr_cfg = cfg.get("execution", {}).get("smart_routing", {})
+    exchanges = cfg.get("exchanges", {})
+    enabled_venues = [
+        name for name, ex in exchanges.items()
+        if isinstance(ex, dict) and ex.get("enabled", False)
+    ]
+    fee_rates = {
+        name: float(ex.get("fee_taker", 0.001))
+        for name, ex in exchanges.items()
+        if isinstance(ex, dict)
+    }
+    return SmartOrderRouter(
+        slippage_predictor=predictor,
+        enabled_venues=enabled_venues or ["binance"],
+        fee_rates=fee_rates or {"binance": 0.001},
+        enabled=bool(sr_cfg.get("enabled", False)),
+        urgency_threshold=float(sr_cfg.get("urgency_threshold", 0.85)),
+        min_score_diff_bps=float(sr_cfg.get("min_score_diff_bps", 0.5)),
+    )
+
+
+def _build_pre_trade_analyzer(cfg: dict[str, Any], predictor: Any) -> Any | None:
+    """Build PreTradeCostAnalyzer when config.execution.pre_trade_analysis.enabled is true."""
+    pt_cfg = cfg.get("execution", {}).get("pre_trade_analysis", {})
+    if not pt_cfg.get("enabled", False):
+        return None
+    from privateye.execution.pre_trade_analyzer import PreTradeCostAnalyzer
+    return PreTradeCostAnalyzer(
+        slippage_predictor=predictor,
+        min_net_edge_pct=float(pt_cfg.get("min_net_edge_pct", 0.0025)),
+        fee_taker=float(cfg.get("backtesting", {}).get("fee_taker", 0.001)),
+    )
+
+
+def _maybe_fit_vwap(exec_engine: Any, cfg: dict[str, Any]) -> None:
+    """Fit VWAPExecutor on recent historical bars if data is available."""
+    if not cfg.get("execution", {}).get("use_twap", False):
+        return  # TWAP/VWAP slicing is disabled — nothing to fit
+    from privateye.data.loaders import load_bars
+    from privateye.config.loader import get_backtest_config
+    bt_cfg = get_backtest_config(cfg)
+    symbol = cfg.get("symbols", ["BTC/USDT"])[0]
+    timeframe = cfg.get("primary_timeframe", "1h")
+    try:
+        bars = load_bars(symbol, timeframe, data_dir=bt_cfg.get("data_dir", "data/historical"))
+        if not bars.empty:
+            exec_engine.fit_volume_profile(bars)
+    except Exception as exc:
+        log.debug(f"[main] VWAP fit skipped: {exc}")
+
 
 def _active_exchange_name(cfg: dict[str, Any]) -> str:
     """Return the single exchange enabled for trading.
@@ -233,6 +318,48 @@ def _build_alert_manager(bus: Any, cfg: dict[str, Any]) -> Any:
     return manager
 
 
+def _build_feedback_store(cfg: dict[str, Any]) -> Any:
+    """Build a FeedbackStore with optional JSONL persistence.
+
+    Returns a FeedbackStore instance.  Always succeeds.
+    """
+    from privateye.feedback.store import FeedbackStore
+    feedback_cfg = cfg.get("phase4", {}).get("feedback", {})
+    maxlen = int(feedback_cfg.get("maxlen", 1000))
+    persist_path = feedback_cfg.get("persist_path", None)
+    return FeedbackStore(maxlen=maxlen, persist_path=persist_path)
+
+
+def _build_model_versions_callback(artifacts_dir: str) -> Any:
+    """Return a callable that lists checkpoint history for all 5 model classes.
+
+    Used to populate GET /api/model-versions on the dashboard.
+    """
+    from pathlib import Path
+    from privateye.models.checkpoint import list_checkpoints
+
+    checkpoint_dir = Path(artifacts_dir) / "checkpoints"
+    model_names = [
+        "GBMClassifier", "LGBMClassifier", "LSTMForecaster",
+        "AttentionLSTM", "RegimeDetector",
+    ]
+
+    def _get_versions() -> list[dict]:
+        results = []
+        for name in model_names:
+            try:
+                ckpts = list_checkpoints(name, checkpoint_dir)
+                for ck in ckpts:
+                    results.append({**ck, "model_name": name})
+            except Exception:
+                pass
+        # Sort newest first
+        results.sort(key=lambda x: x.get("saved_at", ""), reverse=True)
+        return results
+
+    return _get_versions
+
+
 def _maybe_wire_online_learner(
     bus: Any, strategies: list, cfg: dict[str, Any]
 ) -> None:
@@ -258,20 +385,74 @@ def _maybe_wire_online_learner(
     from privateye.models.online_learning import OnlineLearner
 
     artifacts_dir = cfg.get("ml", {}).get("artifacts_dir", "privateye/models/artifacts")
-    learner = OnlineLearner(bus, fusion._ensemble, ol_cfg, artifacts_dir=artifacts_dir)
+    drift_cfg = cfg.get("phase1", {}).get("drift_detection", {})
+    # Phase 4: pass audit_log config from robustness block into online_learning config
+    robustness_cfg = cfg.get("robustness", {})
+    audit_log_cfg = robustness_cfg.get("audit_log", {})
+    ol_cfg_with_audit = {**ol_cfg, "audit_log": audit_log_cfg}
+    learner = OnlineLearner(
+        bus, fusion._ensemble, ol_cfg_with_audit,
+        artifacts_dir=artifacts_dir,
+        drift_config=drift_cfg,
+    )
     bus.subscribe(EventType.MARKET_DATA, learner.on_market_data)
+
+    # Phase 4B: wire live performance gate to FILL events
+    if ol_cfg.get("live_performance_gate", {}).get("enabled", False):
+        bus.subscribe(EventType.FILL, learner.on_fill)
+        log.info("[main] OnlineLearner live performance gate wired to FILL events")
+
     log.info(
         "[main] OnlineLearner wired — retrain every "
         f"{ol_cfg.get('retrain_every_bars', 200)} bars on "
         f"{ol_cfg.get('models', ['gbm', 'lstm', 'regime'])}"
+        + (" (drift gate active)" if drift_cfg.get("enabled", False) else "")
     )
+
+
+async def _enrich_bars_with_alt_data(
+    bars: "Any",
+    symbol: str,
+    fr_provider: "Any | None",
+    fg_provider: "Any | None",
+    cfg: dict[str, Any],
+) -> "Any":
+    """Enrich a bars DataFrame with live alt-data columns (funding_rate, fear_greed).
+
+    Phase 1: called from run_paper() / run_live() on_market_data when
+    alt_data.auto_fetch_live is True.  Any provider error is caught; bars are
+    returned unchanged so the strategy loop is never blocked.
+    """
+    import pandas as _pd
+
+    result = bars
+
+    if fr_provider is not None:
+        try:
+            fr_data = await fr_provider.fetch_latest()
+            result = result.copy()
+            result["funding_rate"] = float(fr_data.get("funding_rate", 0.0))
+            result["open_interest"] = float(fr_data.get("open_interest", 0.0))
+        except Exception as exc:
+            log.warning(f"[main] FundingRateProvider failed: {exc!r}")
+
+    if fg_provider is not None:
+        try:
+            fg_data = await fg_provider.fetch_latest()
+            if "fear_greed" not in result.columns:
+                result = result.copy()
+            result["fear_greed"] = float(fg_data.get("fear_greed", 50.0))
+        except Exception as exc:
+            log.warning(f"[main] FearGreedProvider failed: {exc!r}")
+
+    return result
 
 
 def run_backtest(cfg: dict[str, Any]):
     from privateye.backtesting.engine import BacktestEngine
     from privateye.backtesting.simulator import SimulatedExchange
     from privateye.config.loader import get_backtest_config
-    from privateye.data.providers.csv_provider import CSVProvider
+    from privateye.data.loaders import load_bars
     from privateye.risk.manager import RiskManager
 
     bt_cfg = get_backtest_config(cfg)
@@ -295,14 +476,17 @@ def run_backtest(cfg: dict[str, Any]):
     )
     engine = BacktestEngine(strategies, risk_manager, exchange, cfg,
                             black_swan_guard=black_swan_guard)
-    provider = CSVProvider(data_dir)
+
+    # Phase 0: optional MLflow tracking
+    from privateye.tracking.mlflow_tracker import MLflowTracker
+    tracker = MLflowTracker(cfg.get("phase0", {}).get("mlflow", {}))
 
     symbols = cfg.get("symbols", ["BTC/USDT"])
     timeframe = cfg.get("primary_timeframe", "1h")
 
     last_report = None
     for symbol in symbols:
-        bars = provider.load(symbol, timeframe)
+        bars = load_bars(symbol, timeframe, data_dir=data_dir)
         if bars.empty:
             log.error(f"No data for {symbol} {timeframe}. Run fetch_data.py first.")
             continue
@@ -352,6 +536,14 @@ def run_backtest(cfg: dict[str, Any]):
                 )
             compliance_engine.export_tax_report(report.trades, symbol)
 
+        # Phase 0: log to MLflow
+        tracker.log_backtest(
+            report,
+            run_name=f"backtest_{symbol.replace('/', '_')}_{timeframe}",
+            params={"symbol": symbol, "timeframe": timeframe,
+                    "initial_capital": initial_capital},
+        )
+
     return last_report
 
 
@@ -381,10 +573,38 @@ async def run_paper(cfg: dict[str, Any]) -> None:
     pipeline = DataPipeline(bus, bar_window=bar_window)
     strategies = _build_strategies(cfg)
     asset_filter, exposure_monitor, _ = _build_advanced_risk(cfg)
+
+    # Phase 4: feedback store + model versions
+    _p4_feedback_store = _build_feedback_store(cfg)
+    _p4_artifacts_dir = cfg.get("ml", {}).get("artifacts_dir", "privateye/models/artifacts")
+    _p4_model_versions_cb = _build_model_versions_callback(_p4_artifacts_dir)
+
+    # Phase 1: live alt-data providers (optional, only when auto_fetch_live=true)
+    _alt_fr_provider: Any = None
+    _alt_fg_provider: Any = None
+    alt_cfg = cfg.get("alt_data", {})
+    if alt_cfg.get("auto_fetch_live", False) and alt_cfg.get("enabled", False):
+        try:
+            from privateye.data.providers.funding_rates import FundingRateProvider
+            from privateye.data.providers.sentiment import FearGreedProvider
+            _alt_fr_provider = FundingRateProvider(
+                symbol=alt_cfg.get("funding_rates", {}).get("symbol", "BTC/USDT"),
+            )
+            _alt_fg_provider = FearGreedProvider()
+            log.info("[main] Live alt-data enrichment enabled (FundingRate + FearGreed)")
+        except Exception as exc:
+            log.warning(f"[main] Live alt-data providers unavailable: {exc!r}")
+
+    # Phase 3: slippage predictor, smart router, pre-trade analyzer
+    slip_predictor = _build_slippage_predictor(cfg)
+    smart_router   = _build_smart_order_router(cfg, slip_predictor)
+    pre_trade_analyzer = _build_pre_trade_analyzer(cfg, slip_predictor)
+
     risk_manager = RiskManager(
         cfg.get("risk", {}),
         exposure_monitor=exposure_monitor,
         asset_filter=asset_filter,
+        pre_trade_analyzer=pre_trade_analyzer,
     )
 
     sim_exchange = SimulatedExchange(
@@ -393,8 +613,9 @@ async def run_paper(cfg: dict[str, Any]) -> None:
         fee_taker=bt_cfg.get("fee_taker", 0.001),
         slippage_pct=bt_cfg.get("slippage_pct", 0.0005),
     )
-    exec_engine = ExecutionEngine(bus, simulator=sim_exchange)
+    exec_engine = ExecutionEngine(bus, simulator=sim_exchange, smart_router=smart_router)
     paper_trader = PaperTrader(bus, sim_exchange)
+    _maybe_fit_vwap(exec_engine, cfg)
 
     # Wire MARKET_DATA → strategies → risk → execution
     async def on_signal(signal: Any) -> None:
@@ -410,12 +631,20 @@ async def run_paper(cfg: dict[str, Any]) -> None:
             log.debug(f"Signal rejected: {reason}")
 
     async def on_market_data(snapshot: Any) -> None:
+        # Phase 1: optionally enrich bars with live alt-data before strategy dispatch
+        enriched_snapshot = snapshot
+        if _alt_fr_provider is not None or _alt_fg_provider is not None:
+            import dataclasses as _dc
+            enriched_bars = await _enrich_bars_with_alt_data(
+                snapshot.bars, snapshot.symbol, _alt_fr_provider, _alt_fg_provider, cfg
+            )
+            enriched_snapshot = _dc.replace(snapshot, bars=enriched_bars)
         for strategy in strategies:
-            entry_signals = strategy.on_data(snapshot)
+            entry_signals = strategy.on_data(enriched_snapshot)
             for s in entry_signals:
                 await on_signal(s)
             portfolio = sim_exchange.get_portfolio_state()
-            exit_signals = strategy.on_bar_end(snapshot, portfolio)
+            exit_signals = strategy.on_bar_end(enriched_snapshot, portfolio)
             for s in exit_signals:
                 await on_signal(s)
 
@@ -448,6 +677,10 @@ async def run_paper(cfg: dict[str, Any]) -> None:
             initial_capital=initial_capital,
             get_alerts=alert_manager.get_recent_alerts,
             get_compliance=compliance_engine.get_status,
+            get_execution_stats=None,   # Phase 3: ShadowTracker only in run_shadow
+            get_model_versions=_p4_model_versions_cb,        # Phase 4
+            get_feedback=_p4_feedback_store.get_recent,      # Phase 4
+            post_feedback=_p4_feedback_store.submit_feedback, # Phase 4
         )
     )
 
@@ -534,13 +767,26 @@ async def run_live(cfg: dict[str, Any]) -> None:
     pipeline = DataPipeline(bus, bar_window=cfg.get("data", {}).get("bar_window", 500))
     strategies = _build_strategies(cfg)
     asset_filter, exposure_monitor, _ = _build_advanced_risk(cfg)
+
+    # Phase 4: feedback store + model versions
+    _p4_feedback_store = _build_feedback_store(cfg)
+    _p4_artifacts_dir = cfg.get("ml", {}).get("artifacts_dir", "privateye/models/artifacts")
+    _p4_model_versions_cb = _build_model_versions_callback(_p4_artifacts_dir)
+
+    # Phase 3: slippage predictor, smart router, pre-trade analyzer
+    slip_predictor_live = _build_slippage_predictor(cfg)
+    smart_router_live   = _build_smart_order_router(cfg, slip_predictor_live)
+    pre_trade_live      = _build_pre_trade_analyzer(cfg, slip_predictor_live)
+
     risk_manager = RiskManager(
         cfg.get("risk", {}),
         exposure_monitor=exposure_monitor,
         asset_filter=asset_filter,
+        pre_trade_analyzer=pre_trade_live,
     )
     adapter = ExchangeAdapter(ex_cfg)
-    exec_engine = ExecutionEngine(bus, adapter=adapter)
+    exec_engine = ExecutionEngine(bus, adapter=adapter, smart_router=smart_router_live)
+    _maybe_fit_vwap(exec_engine, cfg)
     symbols = cfg.get("symbols", ["BTC/USDT"])
     timeframes = cfg.get("timeframes", ["1h"])
     primary_tf = cfg.get("primary_timeframe", "1h")
@@ -620,6 +866,10 @@ async def run_live(cfg: dict[str, Any]) -> None:
             initial_capital=initial_capital,
             get_alerts=alert_manager.get_recent_alerts,
             get_compliance=compliance_engine.get_status,
+            get_execution_stats=None,   # Phase 3: ShadowTracker only in run_shadow
+            get_model_versions=_p4_model_versions_cb,        # Phase 4
+            get_feedback=_p4_feedback_store.get_recent,      # Phase 4
+            post_feedback=_p4_feedback_store.submit_feedback, # Phase 4
         )
     )
     bus_task = asyncio.create_task(bus.run())
@@ -670,10 +920,22 @@ async def run_shadow(cfg: dict[str, Any]) -> None:
     pipeline = DataPipeline(bus, bar_window=bar_window)
     strategies = _build_strategies(cfg)
     asset_filter, exposure_monitor, _ = _build_advanced_risk(cfg)
+
+    # Phase 4: feedback store + model versions
+    _p4_feedback_store = _build_feedback_store(cfg)
+    _p4_artifacts_dir = cfg.get("ml", {}).get("artifacts_dir", "privateye/models/artifacts")
+    _p4_model_versions_cb = _build_model_versions_callback(_p4_artifacts_dir)
+
+    # Phase 3: slippage predictor, smart router, pre-trade analyzer
+    slip_predictor_shadow = _build_slippage_predictor(cfg)
+    smart_router_shadow   = _build_smart_order_router(cfg, slip_predictor_shadow)
+    pre_trade_shadow      = _build_pre_trade_analyzer(cfg, slip_predictor_shadow)
+
     risk_manager = RiskManager(
         cfg.get("risk", {}),
         exposure_monitor=exposure_monitor,
         asset_filter=asset_filter,
+        pre_trade_analyzer=pre_trade_shadow,
     )
 
     sim_exchange = SimulatedExchange(
@@ -682,8 +944,9 @@ async def run_shadow(cfg: dict[str, Any]) -> None:
         fee_taker=bt_cfg.get("fee_taker", 0.001),
         slippage_pct=bt_cfg.get("slippage_pct", 0.0005),
     )
-    exec_engine = ExecutionEngine(bus, simulator=sim_exchange)
+    exec_engine = ExecutionEngine(bus, simulator=sim_exchange, smart_router=smart_router_shadow)
     paper_trader = PaperTrader(bus, sim_exchange)
+    _maybe_fit_vwap(exec_engine, cfg)
 
     async def on_signal(signal: Any) -> None:
         allowed, c_reason = compliance_engine.check_symbol(signal.symbol)
@@ -717,19 +980,23 @@ async def run_shadow(cfg: dict[str, Any]) -> None:
     bus.subscribe(EventType.MARKET_DATA, on_market_data)
     bus.subscribe(EventType.FILL, on_fill)
 
-    # Phase 6: wire ShadowTracker — price queries only, no real orders
+    # Phase 6 + Phase 3: wire ShadowTracker with Reality Score — price queries only, no real orders
     shadow_cfg = cfg.get("robustness", {}).get("shadow_trading", {})
+    shadow_mode2_cfg = cfg.get("execution", {}).get("shadow_mode_2", {})
+    # Merge shadow_mode_2 keys into the config dict passed to ShadowTracker
+    merged_shadow_cfg = {**shadow_cfg, **shadow_mode2_cfg}
+    baseline_slippage = float(bt_cfg.get("slippage_pct", 0.0005))
     adapter = ExchangeAdapter({
         **ex_cfg,
         "sandbox": ex_cfg.get("sandbox", True),  # read-only, keep sandbox
     })
-    tracker = ShadowTracker(bus, adapter, shadow_cfg)
+    tracker = ShadowTracker(bus, adapter, merged_shadow_cfg, baseline_slippage=baseline_slippage)
     bus.subscribe(EventType.FILL, tracker.on_fill)
 
     # Phase 6: wire OnlineLearner if enabled
     _maybe_wire_online_learner(bus, strategies, cfg)
 
-    # Start dashboard
+    # Start dashboard — Phase 3: pass get_execution_stats=tracker.get_reality_stats
     from privateye.dashboard.server import start_dashboard
     dashboard_cfg = cfg.get("dashboard", {})
     dashboard_task = asyncio.create_task(
@@ -744,6 +1011,10 @@ async def run_shadow(cfg: dict[str, Any]) -> None:
             initial_capital=initial_capital,
             get_alerts=alert_manager.get_recent_alerts,
             get_compliance=compliance_engine.get_status,
+            get_execution_stats=tracker.get_reality_stats,
+            get_model_versions=_p4_model_versions_cb,        # Phase 4
+            get_feedback=_p4_feedback_store.get_recent,      # Phase 4
+            post_feedback=_p4_feedback_store.submit_feedback, # Phase 4
         )
     )
 
@@ -789,7 +1060,7 @@ def run_walk_forward(cfg: dict[str, Any]):
     """
     from privateye.backtesting.walk_forward import WalkForwardConfig, WalkForwardEngine
     from privateye.config.loader import get_backtest_config
-    from privateye.data.providers.csv_provider import CSVProvider
+    from privateye.data.loaders import load_bars
 
     wf_cfg_raw = cfg.get("walk_forward", {})
     wf_config  = WalkForwardConfig.from_config(wf_cfg_raw)
@@ -798,12 +1069,11 @@ def run_walk_forward(cfg: dict[str, Any]):
     symbols    = cfg.get("symbols", ["BTC/USDT"])
     timeframe  = cfg.get("primary_timeframe", "1h")
 
-    engine   = WalkForwardEngine(cfg, wf_config)
-    provider = CSVProvider(data_dir)
+    engine = WalkForwardEngine(cfg, wf_config)
 
     last_report = None
     for symbol in symbols:
-        bars = provider.load(symbol, timeframe)
+        bars = load_bars(symbol, timeframe, data_dir=data_dir)
         if bars.empty:
             log.error(f"No data for {symbol} {timeframe}. Run fetch_data.py first.")
             continue
@@ -821,7 +1091,7 @@ def run_kfold(cfg: dict[str, Any]):
     """
     from privateye.backtesting.kfold import PurgedKFoldConfig, PurgedKFoldEngine
     from privateye.config.loader import get_backtest_config
-    from privateye.data.providers.csv_provider import CSVProvider
+    from privateye.data.loaders import load_bars
 
     kf_cfg_raw = cfg.get("kfold", {})
     kf_config  = PurgedKFoldConfig.from_config(kf_cfg_raw)
@@ -831,12 +1101,11 @@ def run_kfold(cfg: dict[str, Any]):
     symbols    = cfg.get("symbols", ["BTC/USDT"])
     timeframe  = cfg.get("primary_timeframe", "1h")
 
-    engine   = PurgedKFoldEngine(cfg, kf_config, metric=metric)
-    provider = CSVProvider(data_dir)
+    engine = PurgedKFoldEngine(cfg, kf_config, metric=metric)
 
     last_report = None
     for symbol in symbols:
-        bars = provider.load(symbol, timeframe)
+        bars = load_bars(symbol, timeframe, data_dir=data_dir)
         if bars.empty:
             log.error(f"No data for {symbol} {timeframe}. Run fetch_data.py first.")
             continue
@@ -856,7 +1125,7 @@ def run_optimize(cfg: dict[str, Any]):
     """
     from privateye.backtesting.optimizer import GridSearchOptimizer, OptimizationConfig
     from privateye.config.loader import get_backtest_config
-    from privateye.data.providers.csv_provider import CSVProvider
+    from privateye.data.loaders import load_bars
 
     opt_raw       = cfg.get("optimization", {})
     strategy_name = opt_raw.get("strategy_name", "directional")
@@ -872,7 +1141,7 @@ def run_optimize(cfg: dict[str, Any]):
     )
 
     data_dir = get_backtest_config(cfg).get("data_dir", "data/historical")
-    bars     = CSVProvider(data_dir).load(opt_config.symbol, opt_config.timeframe)
+    bars     = load_bars(opt_config.symbol, opt_config.timeframe, data_dir=data_dir)
 
     if bars.empty:
         log.error(
@@ -887,10 +1156,60 @@ def run_optimize(cfg: dict[str, Any]):
     return report
 
 
+def run_golden_suite(cfg: dict[str, Any]):
+    """Run the golden backtest suite and save artifacts/golden_results_v1.0.json."""
+    from privateye.backtesting.golden_suite import run_golden_backtest
+    return run_golden_backtest(cfg)
+
+
+def run_portfolio_backtest(cfg: dict[str, Any]):
+    """
+    Time-synchronized multi-symbol portfolio backtest.
+
+    All symbols share a single SimulatedExchange so cash depletion from
+    one symbol constrains entries in all others.  Reads bars from
+    ``cfg["backtesting"]["data_dir"]``, replays them in lock-step, and
+    prints a ``PortfolioBacktestReport`` with per-symbol and aggregate metrics.
+    Returns the report (or ``None`` when no data is available).
+    """
+    from privateye.backtesting.portfolio_engine import PortfolioBacktestEngine
+    from privateye.config.loader import get_backtest_config
+    from privateye.data.loaders import load_bars
+
+    bt_cfg   = get_backtest_config(cfg)
+    data_dir = bt_cfg.get("data_dir", "data/historical")
+    symbols  = cfg.get("symbols", ["BTC/USDT"])
+    timeframe = cfg.get("primary_timeframe", "1h")
+
+    bars_by_symbol: dict = {}
+    for symbol in symbols:
+        bars = load_bars(symbol, timeframe, data_dir=data_dir)
+        if bars.empty:
+            log.warning(f"[portfolio_backtest] No data for {symbol} — skipping")
+            continue
+        bars_by_symbol[symbol] = bars
+
+    if not bars_by_symbol:
+        log.error(
+            "No bars loaded for any symbol. Run fetch_data.py first."
+        )
+        return None
+
+    engine = PortfolioBacktestEngine(cfg)
+    report = engine.run(bars_by_symbol, timeframe)
+    print(report)
+    return report
+
+
 def cli() -> None:
     parser = argparse.ArgumentParser(description="PrivateEyeTrader")
-    parser.add_argument("--mode", choices=["backtest", "paper", "live", "shadow", "walk_forward", "optimize", "kfold"],
-                        help="Override mode from config")
+    parser.add_argument(
+        "--mode",
+        choices=["backtest", "paper", "live", "shadow",
+                 "walk_forward", "optimize", "kfold", "golden_suite",
+                 "portfolio_backtest"],
+        help="Override mode from config",
+    )
     parser.add_argument("--config", default="privateye/config/settings.yaml",
                         help="Path to settings.yaml")
     args = parser.parse_args()
@@ -915,6 +1234,10 @@ def cli() -> None:
         run_optimize(cfg)
     elif mode == "kfold":
         run_kfold(cfg)
+    elif mode == "golden_suite":
+        run_golden_suite(cfg)
+    elif mode == "portfolio_backtest":
+        run_portfolio_backtest(cfg)
     else:
         log.error(f"Unknown mode: {mode}")
         sys.exit(1)

@@ -2,6 +2,10 @@ mode: paper  # backtest | paper | live
 
 symbols:
   - "BTC/USDT"
+  - "ETH/USDT"
+  - "SOL/USDT"
+  - "BNB/USDT"
+  - "AVAX/USDT"
 
 timeframes:
   - "1m"
@@ -33,6 +37,7 @@ risk:
   restricted_assets: []             # e.g. ["LUNA/USDT", "UST/USDT"] — skip entry signals
 
   sizing_method: "fixed_risk"       # fixed_risk | kelly | volatility_targeted
+  portfolio_dd_halt_pct: 0.0       # NEW Phase 5: 0 = disabled; e.g. 0.08 = halt at 8% portfolio DD
 
   kelly:
     fraction: 0.5                   # half-Kelly multiplier
@@ -112,6 +117,7 @@ alerts:
 
 alt_data:
   enabled: false                     # set true after running scripts/fetch_alt_data.py
+  auto_fetch_live: false             # set true to enrich paper/live bars with live alt-data
   funding_rates:
     enabled: true
     symbol: "BTC/USDT"
@@ -127,6 +133,26 @@ execution:
   fee_adjusted_min_return: 0.003     # 0.3% minimum expected return after costs
   limit_patience_bars: 3             # cancel unfilled limit orders after N bars
   limit_order_preference: false      # use LIMIT orders when optimizer allows
+
+  # Phase 3 — Execution & Microstructure
+  predictive_slippage:
+    enabled: true
+    alpha: 0.1
+    avg_daily_volume_usd: 500000000  # 500M USD/day (BTC/USDT default)
+
+  smart_routing:
+    enabled: false                   # multi-venue routing (Bybit disabled by default)
+    min_score_diff_bps: 0.5          # minimum cost diff (bps) to switch venues
+    urgency_threshold: 0.85          # confidence above which MARKET order is chosen
+
+  pre_trade_analysis:
+    enabled: false                   # Gate 11: reject trades with net_edge < threshold
+    min_net_edge_pct: 0.0025         # 0.25% minimum net edge after fees + slippage
+
+  shadow_mode_2:
+    reality_score_window: 50         # rolling fills window for Reality Score
+    conservative_mode_threshold: 0.75  # Reality Score below this activates conservative mode
+    conservative_size_multiplier: 0.5  # position sizes multiplied by this in conservative mode
 
 ml:
   enabled: true                         # FusionStrategy active — uses GBM + LSTM + regime gates
@@ -164,12 +190,49 @@ ml:
     regime_gate: true                   # suppress directional/MR based on regime
     gbm_gate: true                      # suppress low-probability signals via GBM
     gbm_gate_threshold: 0.30
+    mtf_confirmation:
+      enabled: false                    # set true to require 4h EMA agreement
+      higher_timeframe: "4h"
 
   monte_carlo:
     enabled: false          # set true to run Monte Carlo after backtest
     n_simulations: 1000
     block_size: 20
     seed: 42                # RNG seed for reproducible results
+
+  lgbm:
+    n_estimators: 500
+    max_depth: 6
+    learning_rate: 0.05
+    num_leaves: 63
+    gate_threshold: 0.45
+
+  attention_lstm:
+    lookback_bars: 60
+    label_horizon_bars: 5
+    label_threshold: 0.002
+    hidden_size: 256
+    num_layers: 2
+    dropout: 0.2
+    n_heads: 4
+    epochs: 50
+    patience: 10
+    batch_size: 64
+    lr: 0.0001
+
+  neural_regime:
+    n_states: 4
+    hidden: 64
+    epochs: 50
+    lr: 0.001
+    batch_size: 256
+
+  stacking:
+    n_folds: 5
+    label_horizon: 5
+    label_threshold: 0.002
+    meta_n_estimators: 100
+    enabled: false            # set true after all base models are trained
 
 walk_forward:
   train_bars: 6048      # ~252 trading days at 1h (adjust per timeframe)
@@ -211,6 +274,36 @@ kfold:
   min_test_trades: 5     # flag folds with too few test trades
   metric:          "sharpe_ratio"  # sharpe_ratio | total_pnl | calmar_ratio
 
+phase0:
+  golden_seed: 42
+  golden_date_from: "2023-01-01"
+  golden_date_to:   "2026-01-01"
+  golden_output:    "artifacts/golden_results_v1.0.json"
+  mlflow:
+    enabled: false
+    tracking_uri: "sqlite:///mlflow.db"
+    experiment_name: "privateye-baseline"
+  optuna:
+    enabled: false
+    n_trials: 100
+
+phase1:
+  complete: false
+  features:
+    derivatives_enabled: true
+    macro_enabled: true
+    enhanced_sentiment_enabled: true
+    use_extended_in_models: false   # set true after retraining models on 86-feature data
+  macro_provider:
+    cache_ttl_seconds: 60
+    timeout_seconds: 10
+  drift_detection:
+    enabled: false                  # set true to gate online retraining on drift check
+    p_threshold: 0.01
+    drift_threshold: 0.20
+    min_reference_rows: 200
+    reference_window_bars: 500      # bars fed to drift_detector.fit() on init
+
 robustness:
   online_learning:
     enabled: true                # incremental retrain every retrain_every_bars new MARKET_DATA bars
@@ -219,6 +312,20 @@ robustness:
     models: [gbm, lstm, regime]  # rl excluded by default (slow to retrain)
     validation_gate: true        # new model must not regress val_loss > 10%
     max_val_loss_regression: 0.10
+    # Phase 4 additions
+    ewc:
+      enabled: false
+      lambda: 400.0
+    auto_retrain_on_drift: false
+    live_performance_gate:
+      enabled: false
+      eval_window: 100
+      min_trades: 50
+      degradation_threshold: 0.15
+    # Audit log config passed through to ModelUpdateAuditLog
+    audit_log:
+      enabled: true
+      path: "data/model_audit.jsonl"
 
   self_healing:
     auto_recovery_seconds: 1800  # 30 min before auto-reset probe
@@ -227,3 +334,24 @@ robustness:
   shadow_trading:
     enabled: false
     divergence_alert_threshold_pct: 2.0
+    reality_score_window: 50         # Phase 3: see execution.shadow_mode_2 for override
+    conservative_mode_threshold: 0.75
+
+  # Phase 4: model update audit log (top-level shorthand consumed by main.py)
+  audit_log:
+    enabled: true
+    path: "data/model_audit.jsonl"
+
+phase3:
+  complete: false
+
+phase4:
+  complete: false
+
+portfolio_backtest:
+  optimizer: "equal_weight"         # equal_weight | risk_parity
+  min_bars_for_optimizer: 30        # fall back to equal weight if fewer bars available
+  use_correlation: false            # risk_parity: use correlation matrix adjustment
+
+phase5:
+  complete: false

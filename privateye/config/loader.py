@@ -48,6 +48,10 @@ _ALLOWED_MODES = frozenset({
     "shadow",
     # Phase 8/10/11 — validation modes
     "walk_forward", "optimize", "kfold",
+    # Phase 0 — golden baseline
+    "golden_suite",
+    # Phase 5 — portfolio backtest
+    "portfolio_backtest",
 })
 
 

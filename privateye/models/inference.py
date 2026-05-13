@@ -21,30 +21,55 @@ class ModelEnsemble:
 
     Returns a dict keyed by model name:
         {
-            "regime":   (regime_int, probs_array),
-            "lstm":     (direction, confidence),
-            "gbm":      (gate_prob: float),
-            "rl":       (direction, confidence),
+            "regime":        (regime_int, probs_array),
+            "lstm":          (direction, confidence),
+            "gbm":           (gate_prob: float),
+            "rl":            (direction, confidence),
+            # Phase 2 additions:
+            "lgbm":          (gate_prob: float),
+            "attn_lstm":     (direction, confidence),
+            "neural_regime": (regime_int, probs_array),
+            "stacking":      (direction, confidence) | None,
+            "shap":          dict[str, float] | None,
         }
     """
 
     def __init__(self, artifacts_dir: str | Path = "privateye/models/artifacts") -> None:
         self.artifacts_dir = Path(artifacts_dir)
-        self._regime = None
-        self._lstm   = None
-        self._gbm    = None
-        self._rl     = None
-        self._loaded = False
+        self._regime       = None
+        self._lstm         = None
+        self._gbm          = None
+        self._rl           = None
+        # Phase 2 models
+        self._lgbm         = None
+        self._attn_lstm    = None
+        self._neural_regime = None
+        self._stacking     = None
+        self._loaded       = False
 
     def load_all(self) -> None:
         """Load all available model artifacts. Missing artifacts are skipped."""
-        self._regime = self._try_load_regime()
-        self._lstm   = self._try_load_lstm()
-        self._gbm    = self._try_load_gbm()
-        self._rl     = self._try_load_rl()
-        self._loaded = True
-        loaded = [k for k, v in [("regime", self._regime), ("lstm", self._lstm),
-                                  ("gbm", self._gbm), ("rl", self._rl)] if v]
+        self._regime        = self._try_load_regime()
+        self._lstm          = self._try_load_lstm()
+        self._gbm           = self._try_load_gbm()
+        self._rl            = self._try_load_rl()
+        self._lgbm          = self._try_load_lgbm()
+        self._attn_lstm     = self._try_load_attn_lstm()
+        self._neural_regime = self._try_load_neural_regime()
+        self._stacking      = self._try_load_stacking()
+        self._loaded        = True
+        loaded = [
+            k for k, v in [
+                ("regime", self._regime),
+                ("lstm",   self._lstm),
+                ("gbm",    self._gbm),
+                ("rl",     self._rl),
+                ("lgbm",         self._lgbm),
+                ("attn_lstm",    self._attn_lstm),
+                ("neural_regime", self._neural_regime),
+                ("stacking",     self._stacking),
+            ] if v
+        ]
         log.info(f"[ModelEnsemble] Loaded models: {loaded}")
 
     def predict(self, bars: pd.DataFrame) -> dict:
@@ -81,6 +106,40 @@ class ModelEnsemble:
             except Exception as e:
                 log.debug(f"[ModelEnsemble] rl failed: {e}")
                 result["rl"] = ("flat", 0.0)
+
+        # ── Phase 2 additions ────────────────────────────────────────────────
+
+        if self._lgbm is not None:
+            try:
+                result["lgbm"] = self._lgbm.predict_gate_prob(bars)
+            except Exception as e:
+                log.debug(f"[ModelEnsemble] lgbm failed: {e}")
+                result["lgbm"] = 0.0
+
+        if self._attn_lstm is not None:
+            try:
+                result["attn_lstm"] = self._attn_lstm.predict(bars)
+            except Exception as e:
+                log.debug(f"[ModelEnsemble] attn_lstm failed: {e}")
+                result["attn_lstm"] = ("flat", 0.0)
+
+        if self._neural_regime is not None:
+            try:
+                result["neural_regime"] = self._neural_regime.predict_regime(bars)
+            except Exception as e:
+                log.debug(f"[ModelEnsemble] neural_regime failed: {e}")
+                import numpy as np
+                result["neural_regime"] = (0, np.full(4, 0.25, dtype=np.float32))
+
+        # Stacking meta-learner — receives the full result dict so far
+        if self._stacking is not None:
+            try:
+                result["stacking"] = self._stacking.predict(result)
+            except Exception as e:
+                log.debug(f"[ModelEnsemble] stacking failed: {e}")
+                result["stacking"] = None
+        else:
+            result["stacking"] = None
 
         # SHAP feature importances (XAI) — non-blocking; None when unavailable
         shap_vals: dict[str, float] | None = None
@@ -136,6 +195,46 @@ class ModelEnsemble:
             log.debug(f"[ModelEnsemble] Could not load RL policy: {e}")
             return None
 
+    def _try_load_lgbm(self):
+        try:
+            from privateye.models.lgbm_classifier import LGBMClassifier
+            m = LGBMClassifier(artifacts_dir=self.artifacts_dir)
+            m.load()
+            return m
+        except Exception as e:
+            log.debug(f"[ModelEnsemble] Could not load LGBMClassifier: {e}")
+            return None
+
+    def _try_load_attn_lstm(self):
+        try:
+            from privateye.models.attention_lstm import AttentionLSTM
+            m = AttentionLSTM(artifacts_dir=self.artifacts_dir)
+            m.load()
+            return m
+        except Exception as e:
+            log.debug(f"[ModelEnsemble] Could not load AttentionLSTM: {e}")
+            return None
+
+    def _try_load_neural_regime(self):
+        try:
+            from privateye.models.neural_regime import NeuralRegimeClassifier
+            m = NeuralRegimeClassifier(artifacts_dir=self.artifacts_dir)
+            m.load()
+            return m
+        except Exception as e:
+            log.debug(f"[ModelEnsemble] Could not load NeuralRegimeClassifier: {e}")
+            return None
+
+    def _try_load_stacking(self):
+        try:
+            from privateye.models.stacking_ensemble import StackingEnsemble
+            m = StackingEnsemble(artifacts_dir=self.artifacts_dir)
+            m.load()
+            return m
+        except Exception as e:
+            log.debug(f"[ModelEnsemble] Could not load StackingEnsemble: {e}")
+            return None
+
     @property
     def has_regime(self) -> bool:
         return self._regime is not None
@@ -151,3 +250,19 @@ class ModelEnsemble:
     @property
     def has_rl(self) -> bool:
         return self._rl is not None
+
+    @property
+    def has_lgbm(self) -> bool:
+        return self._lgbm is not None
+
+    @property
+    def has_attn_lstm(self) -> bool:
+        return self._attn_lstm is not None
+
+    @property
+    def has_neural_regime(self) -> bool:
+        return self._neural_regime is not None
+
+    @property
+    def has_stacking(self) -> bool:
+        return self._stacking is not None and self._stacking.is_fitted

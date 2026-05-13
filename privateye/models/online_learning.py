@@ -15,6 +15,22 @@ Config keys (under robustness.online_learning):
   models                   (list,  default ["gbm","lstm","regime"])
   validation_gate          (bool,  default True)
   max_val_loss_regression  (float, default 0.10)
+
+Phase 4 additions (under same config block):
+  ewc:
+    enabled  (bool,  default False)
+    lambda   (float, default 400.0)   EWC regularisation strength
+  auto_retrain_on_drift   (bool,  default False) — publish SYSTEM event when
+                                                   both KS + PSI drift agree
+  live_performance_gate:
+    enabled               (bool,  default False)
+    eval_window           (int,   default 100)   rolling fill deque size
+    min_trades            (int,   default 50)    minimum fills before gate fires
+    degradation_threshold (float, default 0.15)  mean_pnl < best*(1-threshold)
+
+Audit log keys (under robustness.audit_log):
+  enabled  (bool,  default True)
+  path     (str,   default "data/model_audit.jsonl")
 """
 from __future__ import annotations
 
@@ -30,6 +46,7 @@ import pandas as pd
 from privateye.core.types import DataSnapshot, EventType
 from privateye.models.checkpoint import load_checkpoint, prune_old_checkpoints, save_checkpoint
 from privateye.utils.logging import get_logger
+from privateye.utils.time import now_utc
 
 log = get_logger()
 
@@ -53,6 +70,7 @@ class OnlineLearner:
         ensemble: Any,
         config: dict[str, Any],
         artifacts_dir: str | Path = "privateye/models/artifacts",
+        drift_config: dict[str, Any] | None = None,
     ) -> None:
         self.enabled: bool = config.get("enabled", False)
         self._buffer_size: int = config.get("buffer_bars", 2000)
@@ -70,6 +88,68 @@ class OnlineLearner:
         self._bars_since_retrain: int = 0
         self._retrain_lock: asyncio.Lock = asyncio.Lock()
         self._executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1)
+
+        # Phase 1: optional drift detector gate
+        self._drift_detector: Any = None
+        drift_cfg = drift_config or {}
+        if drift_cfg.get("enabled", False):
+            try:
+                from privateye.models.drift import FeatureDriftDetector
+                self._drift_detector = FeatureDriftDetector(
+                    p_threshold=float(drift_cfg.get("p_threshold", 0.01)),
+                    drift_threshold=float(drift_cfg.get("drift_threshold", 0.20)),
+                    min_reference_rows=int(drift_cfg.get("min_reference_rows", 200)),
+                    psi_threshold=float(drift_cfg.get("psi_threshold", 0.20)),  # Phase 4
+                )
+                log.info("[OnlineLearner] FeatureDriftDetector enabled")
+            except ImportError:
+                log.warning(
+                    "[OnlineLearner] scipy not installed — drift detection disabled"
+                )
+
+        # Phase 4A: Elastic Weight Consolidation for LSTM
+        self._ewc: Any = None
+        ewc_cfg = config.get("ewc", {})
+        if ewc_cfg.get("enabled", False):
+            try:
+                from privateye.models.ewc import ElasticWeightConsolidation
+                self._ewc = ElasticWeightConsolidation(
+                    lambda_=float(ewc_cfg.get("lambda", 400.0))
+                )
+                log.info("[OnlineLearner] EWC enabled (lambda=%s)", ewc_cfg.get("lambda", 400.0))
+            except ImportError:
+                log.warning("[OnlineLearner] torch not available — EWC disabled")
+
+        # Phase 4B: Live Performance Gate
+        self._live_perf_enabled: bool = False
+        self._fill_pnls: deque[float] = deque()
+        self._best_mean_pnl: float = float("-inf")
+        self._perf_eval_window: int = 100
+        self._perf_min_trades: int = 50
+        self._perf_degradation_threshold: float = 0.15
+        perf_cfg = config.get("live_performance_gate", {})
+        if perf_cfg.get("enabled", False):
+            self._live_perf_enabled = True
+            self._perf_eval_window = int(perf_cfg.get("eval_window", 100))
+            self._perf_min_trades = int(perf_cfg.get("min_trades", 50))
+            self._perf_degradation_threshold = float(perf_cfg.get("degradation_threshold", 0.15))
+            self._fill_pnls = deque(maxlen=self._perf_eval_window)
+            log.info("[OnlineLearner] Live Performance Gate enabled")
+
+        # Phase 4C: Audit log
+        self._audit_log: Any = None
+        audit_cfg = config.get("audit_log", {})
+        if audit_cfg.get("enabled", True):
+            try:
+                from privateye.models.audit_log import ModelUpdateAuditLog
+                self._audit_log = ModelUpdateAuditLog(
+                    log_path=audit_cfg.get("path", "data/model_audit.jsonl")
+                )
+            except Exception as exc:
+                log.warning(f"[OnlineLearner] Could not init audit log: {exc}")
+
+        # Phase 4C: auto retrain on drift
+        self._auto_retrain_on_drift: bool = config.get("auto_retrain_on_drift", False)
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -107,6 +187,51 @@ class OnlineLearner:
             self._bars_since_retrain = 0
             asyncio.create_task(self._run_retrain())
 
+    async def on_fill(self, fill: Any) -> None:
+        """Phase 4B: Record fill P&L and check live performance gate.
+
+        Wired by main._maybe_wire_online_learner() when live_performance_gate
+        is enabled.  Subscribes to EventType.FILL.
+        """
+        if not self._live_perf_enabled:
+            return
+        pnl = getattr(fill, "realised_pnl", None)
+        if pnl is None:
+            return
+        self._fill_pnls.append(float(pnl))
+        await self._check_live_perf_gate()
+
+    async def _check_live_perf_gate(self) -> None:
+        """Publish CONSERVATIVE_MODE when rolling P&L degrades significantly."""
+        if len(self._fill_pnls) < self._perf_min_trades:
+            return
+
+        mean_pnl = float(np.mean(list(self._fill_pnls)))
+
+        # Update high-water mark
+        if mean_pnl > self._best_mean_pnl:
+            self._best_mean_pnl = mean_pnl
+            return
+
+        # Check for degradation (only fire when we've ever had a positive baseline)
+        if self._best_mean_pnl <= 0:
+            return
+
+        threshold = self._best_mean_pnl * (1.0 - self._perf_degradation_threshold)
+        if mean_pnl < threshold:
+            log.warning(
+                f"[OnlineLearner] Live performance degraded: "
+                f"mean_pnl={mean_pnl:.4f} < best*{1-self._perf_degradation_threshold:.0%}"
+                f"={threshold:.4f} — publishing CONSERVATIVE_MODE"
+            )
+            await self._bus.publish(
+                EventType.CONSERVATIVE_MODE,
+                {
+                    "reason": "live_performance_gate",
+                    "score": float(mean_pnl / max(abs(self._best_mean_pnl), 1e-9)),
+                },
+            )
+
     # ── Retrain orchestrator ──────────────────────────────────────────────────
 
     async def _run_retrain(self) -> None:
@@ -126,6 +251,62 @@ class OnlineLearner:
                 return
 
             bars = _buffer_to_df(self._buffer)
+
+            # Phase 1: drift gate — skip retrain if feature distribution has shifted
+            drift_detected = False
+            drift_fraction_val: float | None = None
+            psi_score_val: float | None = None
+            if self._drift_detector is not None and self._drift_detector.is_fitted:
+                try:
+                    from privateye.data.feature_extractor import extract_features as _extract
+                    features = _extract(bars)
+                    drift_report = self._drift_detector.check(features)
+                    drift_detected = drift_report.is_drifted
+                    drift_fraction_val = drift_report.drift_fraction
+                    psi_score_val = drift_report.psi_score      # Phase 4
+                    if drift_report.is_drifted:
+                        log.warning(
+                            f"[OnlineLearner] Drift detected "
+                            f"({drift_report.drift_fraction:.1%} of features drifted, "
+                            f"min_p={drift_report.min_p_value:.4f}, "
+                            f"psi={drift_report.psi_score:.3f}) — skipping retrain"
+                        )
+                        # Phase 4C: publish SYSTEM event when both KS + PSI agree and
+                        # auto_retrain_on_drift is enabled (note: we skip the actual
+                        # retrain but inform the orchestrator)
+                        if (
+                            self._auto_retrain_on_drift
+                            and drift_report.drift_fraction >= self._drift_detector._drift_threshold
+                            and drift_report.psi_drifted
+                        ):
+                            await self._bus.publish(
+                                EventType.SYSTEM,
+                                {
+                                    "type": "retrain_recommended",
+                                    "reason": "high_confidence_drift",
+                                    "drift_fraction": drift_report.drift_fraction,
+                                    "psi_score": drift_report.psi_score,
+                                    "timestamp": now_utc().isoformat(),
+                                },
+                            )
+                        # Phase 4C: audit log the skipped retrain
+                        if self._audit_log is not None:
+                            self._audit_log.record({
+                                "trigger": "scheduled",
+                                "models_updated": [],
+                                "models_skipped": list(self._models_to_update),
+                                "bars_seen": len(self._buffer),
+                                "drift_detected": True,
+                                "drift_fraction": drift_fraction_val,
+                                "psi_score": psi_score_val,
+                                "live_perf_gate": "not_evaluated",
+                                "ewc_active": self._ewc is not None and
+                                              getattr(self._ewc, "is_consolidated", False),
+                            })
+                        return
+                except Exception as exc:
+                    log.warning(f"[OnlineLearner] Drift check failed ({exc!r}) — proceeding with retrain")
+
             loop = asyncio.get_event_loop()
             models_updated: list[str] = []
             models_skipped: list[str] = []
@@ -181,6 +362,34 @@ class OnlineLearner:
                     log.warning(f"[OnlineLearner] {model_name} retrain failed: {exc}")
                     models_skipped.append(model_name)
                     _try_restore(model, self._checkpoint_dir, model_name)
+
+            # Phase 1: update drift detector reference after successful promotions
+            if self._drift_detector is not None and models_updated:
+                try:
+                    from privateye.data.feature_extractor import extract_features as _extract
+                    features = _extract(bars)
+                    self._drift_detector.fit(features)
+                    log.debug(
+                        f"[OnlineLearner] Drift detector reference updated "
+                        f"({features.shape[0]} bars)"
+                    )
+                except Exception as exc:
+                    log.debug(f"[OnlineLearner] Drift reference update failed: {exc!r}")
+
+            # Phase 4C: audit log the completed retrain cycle
+            if self._audit_log is not None:
+                self._audit_log.record({
+                    "trigger": "scheduled",
+                    "models_updated": models_updated,
+                    "models_skipped": models_skipped,
+                    "bars_seen": len(self._buffer),
+                    "drift_detected": drift_detected,
+                    "drift_fraction": drift_fraction_val,
+                    "psi_score": psi_score_val,
+                    "live_perf_gate": "not_evaluated",
+                    "ewc_active": self._ewc is not None and
+                                  getattr(self._ewc, "is_consolidated", False),
+                })
 
             await self._bus.publish(
                 EventType.MODEL_UPDATED,
@@ -331,6 +540,11 @@ class OnlineLearner:
                 yb = torch.from_numpy(y_tr[idx].astype(np.int64)).to(device)
                 opt.zero_grad()
                 loss = criterion(new_net(xb), yb)
+
+                # Phase 4A: add EWC penalty when consolidated
+                if self._ewc is not None and self._ewc.is_consolidated:
+                    loss = loss + self._ewc.penalty(new_net)
+
                 loss.backward()
                 nn.utils.clip_grad_norm_(new_net.parameters(), 1.0)
                 opt.step()
@@ -348,6 +562,21 @@ class OnlineLearner:
         # Mutate model in-place; save() called by orchestrator on promotion
         lstm._net = new_net.to(device)
         lstm.is_fitted = True
+
+        # Phase 4A: consolidate EWC after successful LSTM promotion
+        # (builds Fisher info for the next incremental retrain)
+        if self._ewc is not None and len(X_val) >= 10:
+            try:
+                import torch.utils.data as td
+                xv_tensor = torch.from_numpy(X_val).to(device)
+                yv_tensor = torch.from_numpy(y_val.astype(np.int64)).to(device)
+                val_ds = td.TensorDataset(xv_tensor, yv_tensor)
+                val_loader = td.DataLoader(val_ds, batch_size=64, shuffle=False)
+                # Consolidation is fast (200 samples by default)
+                self._ewc.consolidate(new_net, val_loader, device, n_samples=200)
+            except Exception as exc:
+                log.warning(f"[OnlineLearner] EWC consolidation failed: {exc}")
+
         return best_val_loss, old_loss
 
     def _retrain_regime(self, bars: pd.DataFrame) -> tuple[float, float]:

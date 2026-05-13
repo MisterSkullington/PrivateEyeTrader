@@ -382,11 +382,16 @@ class TestXAI:
         from privateye.models.inference import ModelEnsemble
         ens = ModelEnsemble.__new__(ModelEnsemble)
         ens.artifacts_dir = Path("nonexistent")
-        ens._regime = None
-        ens._lstm   = None
-        ens._gbm    = None
-        ens._rl     = None
-        ens._loaded = True
+        ens._regime         = None
+        ens._lstm           = None
+        ens._gbm            = None
+        ens._rl             = None
+        # Phase 2 models (not present in artifacts)
+        ens._lgbm           = None
+        ens._attn_lstm      = None
+        ens._neural_regime  = None
+        ens._stacking       = None
+        ens._loaded         = True
 
         bars = self._make_bars()
         result = ens.predict(bars)
@@ -397,11 +402,16 @@ class TestXAI:
         from privateye.models.inference import ModelEnsemble
         ens = ModelEnsemble.__new__(ModelEnsemble)
         ens.artifacts_dir = Path("nonexistent")
-        ens._regime = None
-        ens._lstm   = None
-        ens._gbm    = None
-        ens._rl     = None
-        ens._loaded = True
+        ens._regime         = None
+        ens._lstm           = None
+        ens._gbm            = None
+        ens._rl             = None
+        # Phase 2 models (not present in artifacts)
+        ens._lgbm           = None
+        ens._attn_lstm      = None
+        ens._neural_regime  = None
+        ens._stacking       = None
+        ens._loaded         = True
 
         bars = self._make_bars()
         result = ens.predict(bars)
@@ -416,11 +426,16 @@ class TestXAI:
 
         ens = ModelEnsemble.__new__(ModelEnsemble)
         ens.artifacts_dir = Path("nonexistent")
-        ens._regime = None
-        ens._lstm   = None
-        ens._gbm    = mock_gbm
-        ens._rl     = None
-        ens._loaded = True
+        ens._regime         = None
+        ens._lstm           = None
+        ens._gbm            = mock_gbm
+        ens._rl             = None
+        # Phase 2 models (not present in artifacts)
+        ens._lgbm           = None
+        ens._attn_lstm      = None
+        ens._neural_regime  = None
+        ens._stacking       = None
+        ens._loaded         = True
 
         bars = self._make_bars()
         result = ens.predict(bars)

@@ -44,6 +44,12 @@ class BacktestReport:
     max_consecutive_wins: int = 0
     max_consecutive_losses: int = 0
     omega_ratio: float = 0.0            # gains above zero / |losses below zero|
+    # Phase 0 — per-direction and edge metrics
+    long_trades: int = 0
+    short_trades: int = 0
+    long_win_rate: float = 0.0          # win rate among LONG-side trades only
+    short_win_rate: float = 0.0         # win rate among SHORT-side trades only
+    expected_value: float = 0.0         # (win_rate × avg_win) + ((1−win_rate) × avg_loss)
     equity_curve: list[float] = field(default_factory=list)
     trades: list[TradeRecord] = field(default_factory=list)
 
@@ -54,6 +60,10 @@ class BacktestReport:
             "  BACKTEST REPORT",
             sep,
             f"  Trades          : {self.total_trades}  (W:{self.winning_trades} L:{self.losing_trades})",
+            f"  Long / Short    : {self.long_trades} / {self.short_trades}",
+            f"  Long Win Rate   : {self.long_win_rate * 100:.1f}%",
+            f"  Short Win Rate  : {self.short_win_rate * 100:.1f}%",
+            f"  Expected Value  : {self.expected_value:+.4f} per trade",
             f"  Win Rate        : {self.win_rate * 100:.1f}%",
             f"  Profit Factor   : {self.profit_factor:.2f}",
             f"  Total PnL       : {self.total_pnl:+.2f} ({self.total_pnl_pct:+.1f}%)",
@@ -128,6 +138,11 @@ class BacktestReport:
             "max_consecutive_wins": self.max_consecutive_wins,
             "max_consecutive_losses": self.max_consecutive_losses,
             "omega_ratio": self.omega_ratio,
+            "long_trades": self.long_trades,
+            "short_trades": self.short_trades,
+            "long_win_rate": self.long_win_rate,
+            "short_win_rate": self.short_win_rate,
+            "expected_value": self.expected_value,
             "equity_curve": [float(v) for v in self.equity_curve],
         }
 
@@ -248,6 +263,24 @@ def compute_metrics(
         gains  = float(np.sum(np.maximum(trade_rets_arr, 0.0)))
         losses = float(np.sum(np.maximum(-trade_rets_arr, 0.0)))
         report.omega_ratio = gains / losses if losses > 0 else float("inf")
+
+    # ── Phase 0: per-direction metrics + expected value ───────────────────────
+    if trades:
+        from privateye.core.types import Direction
+        long_t  = [t for t in trades if getattr(t, "side", None) == Direction.LONG]
+        short_t = [t for t in trades if getattr(t, "side", None) == Direction.SHORT]
+        report.long_trades  = len(long_t)
+        report.short_trades = len(short_t)
+        report.long_win_rate  = (
+            sum(1 for t in long_t  if t.pnl > 0) / len(long_t)  if long_t  else 0.0
+        )
+        report.short_win_rate = (
+            sum(1 for t in short_t if t.pnl > 0) / len(short_t) if short_t else 0.0
+        )
+        report.expected_value = (
+            report.win_rate * report.avg_win
+            + (1.0 - report.win_rate) * report.avg_loss
+        )
 
     return report
 

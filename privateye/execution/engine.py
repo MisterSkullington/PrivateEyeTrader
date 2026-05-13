@@ -9,15 +9,25 @@ Responsibilities:
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+import dataclasses
+from datetime import timezone
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
+
+import pandas as pd
 
 from privateye.core.event_bus import AsyncEventBus
 from privateye.core.types import (
     Direction, EventType, Fill, Order, OrderSide, OrderType,
     PortfolioState, Position,
 )
+from privateye.execution.twap import TWAPExecutor
 from privateye.utils.logging import get_logger
 from privateye.utils.time import now_utc
+
+if TYPE_CHECKING:
+    from privateye.execution.smart_order_router import SmartOrderRouter
+    from privateye.execution.vwap import VWAPExecutor
 
 log = get_logger()
 
@@ -29,6 +39,7 @@ class ExecutionEngine:
         adapter: Any = None,           # ExchangeAdapter for live, None for paper
         simulator: Any = None,         # SimulatedExchange for paper/backtest
         exec_config: dict | None = None,
+        smart_router: "SmartOrderRouter | None" = None,  # Phase 3: venue-aware router
     ) -> None:
         self.bus = bus
         self.adapter = adapter
@@ -38,30 +49,75 @@ class ExecutionEngine:
         self._kill_active = False
         self._exec_cfg: dict = exec_config or {}
 
-    async def submit_order(self, order: Order) -> Fill | None:
+        # Phase 3: VWAP executor (set by fit_volume_profile), SmartOrderRouter, conservative mode
+        self._vwap_executor: VWAPExecutor | None = None
+        self._smart_router: SmartOrderRouter | None = smart_router
+        self._conservative_mode: bool = False
+        self._conservative_size_multiplier: float = float(
+            self._exec_cfg.get("shadow_mode_2", {}).get("conservative_size_multiplier", 0.5)
+        )
+        bus.subscribe(EventType.CONSERVATIVE_MODE, self._on_conservative_mode)
+
+    async def submit_order(
+        self,
+        order: Order,
+        bars: pd.DataFrame | None = None,
+    ) -> Fill | None:
         if self._kill_active:
             log.warning(f"Kill switch active — order rejected: {order.symbol}")
             return None
 
+        # Phase 3: Apply conservative size multiplier when Shadow Mode 2.0 is active
+        if self._conservative_mode:
+            reduced_qty = order.quantity * self._conservative_size_multiplier
+            log.info(
+                f"[ExecutionEngine] Conservative mode: reducing qty "
+                f"{order.quantity:.6f} → {reduced_qty:.6f} for {order.symbol}"
+            )
+            order = dataclasses.replace(order, quantity=reduced_qty)
+
         log.info(f"[ExecutionEngine] Submit: {order.side.value} {order.quantity:.6f} {order.symbol}")
 
-        # Auto-TWAP: slice large orders if enabled
+        # Auto-slice large orders using VWAP (when fitted) or TWAP fallback
         use_twap   = self._exec_cfg.get("use_twap", False)
         twap_thr   = float(self._exec_cfg.get("twap_threshold_usd", 1000))
         twap_n     = int(self._exec_cfg.get("twap_slices", 4))
         notional   = order.quantity * order.price
 
         if use_twap and notional > twap_thr:
-            from privateye.execution.twap import TWAPExecutor
-            slices = TWAPExecutor(twap_n).split(order)
+            if self._vwap_executor is not None:
+                current_hour = datetime.now(timezone.utc).hour
+                slices = self._vwap_executor.split(order, current_hour)
+                log.debug(f"[ExecutionEngine] VWAP-sliced into {len(slices)} sub-orders")
+            else:
+                slices = TWAPExecutor(twap_n).split(order)
+                log.debug(f"[ExecutionEngine] TWAP-sliced into {len(slices)} sub-orders")
+
             last_fill = None
             for s in slices:
-                last_fill = await self._submit_single(s)
+                last_fill = await self._submit_single(s, bars=bars)
             return last_fill
 
-        return await self._submit_single(order)
+        return await self._submit_single(order, bars=bars)
 
-    async def _submit_single(self, order: Order) -> Fill | None:
+    async def _submit_single(
+        self,
+        order: Order,
+        bars: pd.DataFrame | None = None,
+    ) -> Fill | None:
+        # Phase 3: Apply SmartOrderRouter annotation (order type + venue selection)
+        # Only annotate when bars are available; without bars the slippage
+        # prediction is a fallback guess and the order type should stay as-is.
+        if self._smart_router is not None and bars is not None:
+            urgency = getattr(order, "_urgency", 0.5)
+            decision = self._smart_router.route(order, urgency=urgency, bars=bars)
+            order = self._smart_router.annotate_order(order, decision)
+            log.debug(
+                f"[ExecutionEngine] SOR decision: venue={decision.venue} "
+                f"type={decision.order_type.value} "
+                f"slip={decision.predicted_slippage_pct:.4%}"
+            )
+
         if self._live_mode and self.adapter:
             if order.order_type == OrderType.LIMIT:
                 fill = await self.adapter.create_limit_order(order)
@@ -157,3 +213,28 @@ class ExecutionEngine:
     def resume(self) -> None:
         self._kill_active = False
         log.info("[ExecutionEngine] Kill switch lifted — trading resumed")
+
+    # ── Phase 3: VWAP + conservative mode ────────────────────────────────────
+
+    def fit_volume_profile(self, bars: pd.DataFrame) -> None:
+        """Fit a VWAPExecutor on historical bars so submit_order can use VWAP slicing.
+
+        Once called, VWAP splitting is used in place of TWAP whenever
+        `use_twap=True` and the order notional exceeds `twap_threshold_usd`.
+        """
+        from privateye.execution.vwap import VWAPExecutor
+        n_slices = int(self._exec_cfg.get("twap_slices", 4))
+        self._vwap_executor = VWAPExecutor(n_slices)
+        self._vwap_executor.fit_volume_profile(bars)
+        log.info("[ExecutionEngine] VWAP volume profile fitted")
+
+    async def _on_conservative_mode(self, payload: Any) -> None:
+        """Handler for CONSERVATIVE_MODE events from ShadowTracker."""
+        self._conservative_mode = True
+        score = payload.get("score", 0.0) if isinstance(payload, dict) else 0.0
+        reason = payload.get("reason", "unknown") if isinstance(payload, dict) else str(payload)
+        log.warning(
+            f"[ExecutionEngine] Conservative mode ACTIVATED by event "
+            f"(reason={reason}, score={score:.3f}) — "
+            f"position sizes will be multiplied by {self._conservative_size_multiplier}"
+        )

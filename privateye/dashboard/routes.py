@@ -28,6 +28,11 @@ def build_router(
     get_health: Callable | None = None,
     get_alerts: Callable | None = None,
     get_compliance: Callable | None = None,
+    get_execution_stats: Callable | None = None,  # Phase 3: ShadowTracker.get_reality_stats
+    # Phase 4 — model versions, feedback store
+    get_model_versions: Callable | None = None,
+    get_feedback: Callable | None = None,
+    post_feedback: Callable | None = None,
 ) -> APIRouter:
     router = APIRouter()
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
@@ -223,6 +228,29 @@ def build_router(
             for a in alerts
         ]
 
+    # ── Execution stats (Phase 3: reality score + conservative mode) ────────
+
+    @router.get("/api/execution-stats", dependencies=_auth)
+    async def api_execution_stats():
+        """
+        Execution quality stats from the Shadow Mode 2.0 tracker.
+
+        Returns reality_score (1.0 = perfect calibration), conservative_mode flag,
+        and the standard ShadowTracker slippage metrics.
+
+        Returns safe defaults when ShadowTracker is not wired.
+        """
+        if get_execution_stats is None:
+            return {
+                "n_fills":                   0,
+                "mean_slippage_pct":         0.0,
+                "max_slippage_pct":          0.0,
+                "pct_fills_above_threshold": 0.0,
+                "reality_score":             1.0,
+                "conservative_mode":         False,
+            }
+        return get_execution_stats()
+
     # ── Compliance status ───────────────────────────────────────────────────
 
     @router.get("/api/compliance", dependencies=_auth)
@@ -244,6 +272,48 @@ def build_router(
                 "total_disallowed_loss": 0.0,
             }
         return get_compliance()
+
+    # ── Phase 4: Model versions + Feedback ─────────────────────────────────
+
+    @router.get("/api/model-versions", dependencies=_auth)
+    async def api_model_versions():
+        """Checkpoint history for all model classes, newest first.
+
+        Returns an empty list when get_model_versions is not wired.
+        """
+        if get_model_versions is None:
+            return []
+        return get_model_versions()
+
+    @router.get("/api/feedback", dependencies=_auth)
+    async def api_feedback(limit: int = 50):
+        """Recent FeedbackRecord dicts, newest first.
+
+        Returns an empty list when FeedbackStore is not wired.
+        """
+        if get_feedback is None:
+            return []
+        return get_feedback(limit)
+
+    @router.post("/api/signal-feedback", dependencies=_auth)
+    async def api_signal_feedback(request: Request):
+        """Submit a thumbs-up/down for a previously recorded signal.
+
+        Expected body: ``{"signal_key": str, "thumbs_up": bool}``
+
+        Returns ``{"ok": true}`` if the record was found, ``{"ok": false}`` otherwise.
+        """
+        if post_feedback is None:
+            return {"ok": False}
+        try:
+            body = await request.json()
+            signal_key = str(body["signal_key"])
+            thumbs_up = bool(body["thumbs_up"])
+            ok = post_feedback(signal_key, thumbs_up)
+            return {"ok": bool(ok)}
+        except Exception as exc:
+            log.warning(f"[Dashboard] /api/signal-feedback error: {exc}")
+            return {"ok": False}
 
     # ── Kill switch ─────────────────────────────────────────────────────────
 

@@ -2,16 +2,18 @@
 Risk manager — the last gate before an order reaches the exchange.
 
 Gate order (entry signals):
+ 12. portfolio circuit breaker → reject when portfolio DD ≥ threshold (Phase 5)
   1. Direction.FLAT      → always approved (exit)
   2. restricted_assets   → reject
   3. _halted             → reject
   4. daily drawdown      → halt + reject
   5. confidence          → reject
   6. AssetFilter         → reject (skipped when filter=None or bars=None)
-  7. _compute_size()     → qty via SizingRouter
+  7. _compute_size()     → qty via SizingRouter (uses PortfolioOptimizer cap if set)
   8. ExposureMonitor     → reject (skipped when monitor=None)
   9. cash availability   → reject
  10. existing same-side  → reject
+ 11. PreTradeCostAnalyzer → reject when net_edge < min_net_edge_pct (Phase 3)
   → build Order (respects preferred_order_type from signal.metadata)
 
 Returns (approved: bool, reason: str, order_if_approved: Order | None).
@@ -38,8 +40,10 @@ class RiskManager:
     def __init__(
         self,
         config: dict[str, Any],
-        exposure_monitor: Any = None,   # ExposureMonitor | None
-        asset_filter: Any = None,       # AssetFilter | None
+        exposure_monitor: Any = None,       # ExposureMonitor | None
+        asset_filter: Any = None,           # AssetFilter | None
+        pre_trade_analyzer: Any = None,     # PreTradeCostAnalyzer | None  (Phase 3 Gate 11)
+        portfolio_optimizer: Any = None,    # PortfolioOptimizer | None  (Phase 5 Gate 12)
     ) -> None:
         self._config = config
         self.max_risk_pct: float     = config.get("max_risk_per_trade_pct", 0.01)
@@ -61,6 +65,15 @@ class RiskManager:
         self._asset_filter = asset_filter
         self.sizing_method = SizingMethod(config.get("sizing_method", "fixed_risk"))
 
+        # Phase 3 Gate 11: Pre-trade cost analysis (disabled by default — pass analyzer to enable)
+        self._pre_trade_analyzer = pre_trade_analyzer
+
+        # Phase 5 Gate 12: Portfolio-level daily drawdown circuit breaker
+        self._portfolio_dd_halt_pct: float = float(config.get("portfolio_dd_halt_pct", 0.0))
+        self._portfolio_daily_hwm: float   = float("-inf")
+        self._portfolio_circuit_open: bool = False
+        self._portfolio_optimizer = portfolio_optimizer
+
     # ── Public interface ────────────────────────────────────────────────────
 
     def evaluate_signal(
@@ -80,6 +93,24 @@ class RiskManager:
           bars_by_symbol — dict[symbol → bars] (for ExposureMonitor)
           trade_history  — list[TradeRecord] (for Kelly sizing)
         """
+        # Gate 12 (Phase 5): Portfolio-level daily drawdown circuit breaker.
+        # Tracks a portfolio-wide HWM; if equity drops ≥ portfolio_dd_halt_pct from
+        # that HWM, ALL new entries are blocked (not just the triggering symbol).
+        # Set portfolio_dd_halt_pct = 0.0 to disable (default).
+        if self._portfolio_dd_halt_pct > 0:
+            equity = portfolio.equity
+            if equity > self._portfolio_daily_hwm:
+                self._portfolio_daily_hwm = equity
+            dd = 0.0
+            if self._portfolio_daily_hwm > 0:
+                dd = (self._portfolio_daily_hwm - equity) / self._portfolio_daily_hwm
+                if dd >= self._portfolio_dd_halt_pct:
+                    self._portfolio_circuit_open = True
+            if self._portfolio_circuit_open:
+                return False, (
+                    f"Portfolio circuit breaker: DD={dd:.1%} ≥ {self._portfolio_dd_halt_pct:.1%}"
+                ), None
+
         # Gate 1: FLAT signals are always approved (exits)
         if signal.direction == Direction.FLAT:
             order = self._build_exit_order(signal, portfolio)
@@ -117,8 +148,8 @@ class RiskManager:
             if not tradeable:
                 return False, f"AssetFilter: {filter_reason}", None
 
-        # Gate 7: Compute position size
-        qty = self._compute_size(signal, portfolio, bars, trade_history)
+        # Gate 7: Compute position size (Phase 5: passes bars_by_symbol for optimizer cap)
+        qty = self._compute_size(signal, portfolio, bars, trade_history, bars_by_symbol)
 
         if qty <= 0:
             return False, "Computed quantity is zero (stop too close or equity too low)", None
@@ -150,6 +181,15 @@ class RiskManager:
             if existing.side == signal.direction:
                 return False, f"Already in {signal.direction.value} position for {signal.symbol}", None
 
+        # Gate 11 (Phase 3): Pre-trade cost analysis — reject when net edge is too thin
+        if self._pre_trade_analyzer is not None:
+            result = self._pre_trade_analyzer.analyze(signal, qty, portfolio, bars)
+            if not result.approved:
+                log.info(
+                    f"[RiskManager] Gate 11 REJECTED {signal.symbol}: {result.reason}"
+                )
+                return False, f"Pre-trade cost screen: {result.reason}", None
+
         order = self._build_entry_order(signal, qty)
         log.info(
             f"[RiskManager] APPROVED {signal.direction.value} {signal.symbol} "
@@ -175,6 +215,16 @@ class RiskManager:
     def is_halted(self) -> bool:
         return self._halted
 
+    def reset_portfolio_daily_hwm(self) -> None:
+        """Reset the portfolio-level daily high-water mark and clear the circuit breaker.
+
+        Call at midnight (same pattern as the per-symbol daily DD reset in SimulatedExchange)
+        so the circuit resets each trading day.
+        """
+        self._portfolio_daily_hwm = float("-inf")
+        self._portfolio_circuit_open = False
+        log.info("[RiskManager] Portfolio daily HWM reset")
+
     # ── Internal ────────────────────────────────────────────────────────────
 
     def _halt(self, reason: str) -> None:
@@ -189,8 +239,14 @@ class RiskManager:
         portfolio: PortfolioState,
         bars: pd.DataFrame | None,
         trade_history: list[TradeRecord] | None,
+        bars_by_symbol: dict[str, pd.DataFrame] | None = None,
     ) -> float:
-        """Route to the configured sizing algorithm and apply notional cap."""
+        """Route to the configured sizing algorithm and apply notional cap.
+
+        Phase 5: when a PortfolioOptimizer is set and bars_by_symbol is provided,
+        the effective notional cap is min(config_max_pct, optimizer_weight[symbol]).
+        This is a soft cap — the absolute config limit always wins.
+        """
         qty = route_sizing(
             method=self.sizing_method,
             equity=portfolio.equity,
@@ -199,7 +255,18 @@ class RiskManager:
             bars=bars,
             trade_history=trade_history,
         )
-        return cap_to_max_notional(qty, signal.entry_price, portfolio.equity, self.max_notional_pct)
+
+        # Phase 5: optimizer-aware notional cap
+        if self._portfolio_optimizer is not None and bars_by_symbol:
+            weights = self._portfolio_optimizer.compute_weights(
+                list(bars_by_symbol.keys()), bars_by_symbol
+            )
+            optimizer_cap = weights.get(signal.symbol, 1.0)
+            effective_max_pct = min(self.max_notional_pct, optimizer_cap)
+        else:
+            effective_max_pct = self.max_notional_pct
+
+        return cap_to_max_notional(qty, signal.entry_price, portfolio.equity, effective_max_pct)
 
     def _build_entry_order(self, signal: TradingSignal, qty: float) -> Order:
         side = OrderSide.BUY if signal.direction == Direction.LONG else OrderSide.SELL

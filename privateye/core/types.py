@@ -22,6 +22,8 @@ class EventType(str, Enum):
     PROVIDER_HEALTH   = "provider_health"    # payload: dict from get_health()
     MODEL_UPDATED     = "model_updated"      # payload: {"models_updated": [...], "bars_seen": N}
     SHADOW_DIVERGENCE = "shadow_divergence"  # payload: ShadowFillRecord
+    # Phase 3 — Execution & Microstructure
+    CONSERVATIVE_MODE = "conservative_mode"  # payload: {"reason": str, "score": float}
 
 
 class OrderSide(str, Enum):
