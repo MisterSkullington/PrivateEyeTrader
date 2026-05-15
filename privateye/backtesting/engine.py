@@ -54,8 +54,28 @@ class BacktestEngine:
         equity_curve: list[float] = []
         min_warmup = max(200, self.bar_window // 2)
 
+        # Periodic progress logging — every ~10% of bars (or every 1000, whichever
+        # is more frequent). Without this, ML-heavy backtests look hung for the
+        # 10–30 min the bar loop is silently grinding through 8000+ bars.
+        import time as _time
+        _progress_every = max(100, min(1000, len(bars) // 10))
+        _t_start = _time.perf_counter()
+        _last_log = _t_start
+
         for i in range(len(bars)):
             bar = bars.iloc[i].to_dict()
+
+            if i > 0 and i % _progress_every == 0:
+                _now = _time.perf_counter()
+                _bars_per_sec = i / max(1e-6, _now - _t_start)
+                _eta_sec = (len(bars) - i) / max(1e-6, _bars_per_sec)
+                _trades_so_far = len(self.exchange.trade_records)
+                log.info(
+                    f"[Backtest] {i}/{len(bars)} bars "
+                    f"({100*i/len(bars):.0f}%, {_bars_per_sec:.1f} bars/s, "
+                    f"ETA {_eta_sec/60:.1f}m, trades={_trades_so_far})"
+                )
+                _last_log = _now
 
             # Strict: only data up to and including bar i (no future)
             window_start = max(0, i + 1 - self.bar_window)

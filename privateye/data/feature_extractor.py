@@ -42,6 +42,51 @@ FEATURE_NAMES: list[str] = [
 
 assert len(FEATURE_NAMES) == 68
 
+# Single-slot cache for the last call. The ensemble predict path calls
+# extract_features 4× per bar with the same `bars` object (once each for
+# regime / lstm / gbm / rl). Caching the last result collapses that to
+# one real computation per bar — ~130 ms saved per bar on a 500-bar window,
+# which dominates BacktestEngine wall clock when ml.enabled=True.
+#
+# Cache key uses (id, len, last-timestamp). id() catches "different slice
+# object"; len catches appended bars; last-timestamp is a defensive tie-
+# breaker for the unlikely id-collision case where Python reuses an
+# address after the previous slice is garbage-collected. Single-slot
+# (no LRU) — the working set is always exactly one bars window.
+_LAST_KEY: tuple | None = None
+_LAST_FEATURES: np.ndarray | None = None
+
+
+def _cache_key(bars: pd.DataFrame) -> tuple | None:
+    """Build a cheap cache key for a bars DataFrame.
+
+    Combines:
+      - id(bars):               cheap; matches when the *same* object is reused.
+      - len(bars):              detects appended bars on a reused object.
+      - last_ts:                detects same-id-but-different-content via index.
+      - first_close, last_close: cheap content fingerprint; catches the case
+                                  where Python recycled id() after GC and a new
+                                  DataFrame happens to land at the same address.
+      - tuple(bars.columns):    discriminates schema differences (e.g. with vs.
+                                  without alt-data columns) when OHLC is
+                                  otherwise identical (same-seed test data).
+
+    Returns None when bars is empty or any column lookup fails, which disables
+    caching for that call but never raises.
+    """
+    if len(bars) == 0:
+        return None
+    try:
+        idx = bars.index
+        last_ts = idx[-1] if len(idx) else None
+        close = bars["close"]
+        first_close = float(close.iloc[0])
+        last_close = float(close.iloc[-1])
+        cols = tuple(bars.columns)
+    except Exception:
+        return None
+    return (id(bars), len(bars), last_ts, first_close, last_close, cols)
+
 
 def extract_features(bars: pd.DataFrame) -> np.ndarray:
     """
@@ -55,7 +100,16 @@ def extract_features(bars: pd.DataFrame) -> np.ndarray:
 
     Returns:
         np.ndarray of shape (N, 68), dtype float32. NaN/Inf replaced with 0.
+
+    Result is memoised in a single-slot cache keyed by the bars DataFrame
+    identity — repeated calls with the same `bars` object (e.g. from each
+    model in ModelEnsemble.predict) return the cached array in O(1).
     """
+    global _LAST_KEY, _LAST_FEATURES
+    key = _cache_key(bars)
+    if key is not None and key == _LAST_KEY and _LAST_FEATURES is not None:
+        return _LAST_FEATURES
+
     feats = pd.DataFrame(index=bars.index)
 
     close = bars["close"].astype(float)
@@ -308,7 +362,11 @@ def extract_features(bars: pd.DataFrame) -> np.ndarray:
 
     # ── Assemble ─────────────────────────────────────────────────────────────
     arr = feats[FEATURE_NAMES].values.astype(np.float32)
-    return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    result = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    if key is not None:
+        _LAST_KEY = key
+        _LAST_FEATURES = result
+    return result
 
 
 def extract_latest(bars: pd.DataFrame) -> np.ndarray:

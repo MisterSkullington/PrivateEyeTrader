@@ -14,9 +14,18 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
 
+from privateye.data.feature_extractor import extract_features
 from privateye.models.base import BaseModel
-from privateye.models.rl_env import ACTIONS, N_ACTIONS, TradingEnv
+from privateye.models.rl_env import (
+    ACTIONS,
+    N_ACTIONS,
+    N_FEATURES,
+    N_PORTFOLIO,
+    OBS_LOOKBACK,
+    TradingEnv,
+)
 from privateye.utils.logging import get_logger
 
 log = get_logger()
@@ -91,25 +100,24 @@ class RLPolicy(BaseModel):
     # ── Inference ────────────────────────────────────────────────────────────
 
     def predict(self, bars: pd.DataFrame) -> tuple[str, float]:
-        """Returns (direction, confidence) for the current bar."""
+        """Returns (direction, confidence) for the most recent bar.
+
+        Builds the observation directly from the last OBS_LOOKBACK bars without
+        stepping a TradingEnv — ~500× faster than the previous env-replay loop
+        and matches the env reset-state distribution that PPO was trained on.
+
+        The previous implementation re-built a TradingEnv on every call and ran
+        len(bars)-1 inner PPO predict() calls to "step" to the latest bar. That
+        was O(window_size) PPO forwards per outer call (~500× too many) AND it
+        fed the policy a fictional portfolio state from the policy's own
+        deterministic self-replay — not the real backtest portfolio.
+        """
         self._require_fitted()
         _require_sb3()
 
-        # Build obs from a temporary env stepped to the last bar
-        tmp_env = TradingEnv(bars)
-        obs, _ = tmp_env.reset()
-        # Step through all bars up to the last one to get the latest observation
-        for i in range(len(bars) - 1):
-            action, _ = self._model.predict(obs, deterministic=True)
-            obs, _, done, _, _ = tmp_env.step(int(action))
-            if done:
-                break
-
+        obs = self._build_obs(bars)
         action_int, _ = self._model.predict(obs, deterministic=False)
-        action_int    = int(action_int)
-        direction     = ACTIONS[action_int]
-
-        # Estimate confidence from action probability distribution
+        direction = ACTIONS[int(action_int)]
         confidence = self._action_confidence(obs)
 
         # Map SHORT to FLAT (exchange doesn't support shorts yet)
@@ -124,6 +132,32 @@ class RLPolicy(BaseModel):
             confidence = 0.0
 
         return direction, float(confidence)
+
+    def _build_obs(self, bars: pd.DataFrame) -> np.ndarray:
+        """Construct an (OBS_DIM,) observation matching TradingEnv._obs() at reset.
+
+        Market half (4080 floats): last OBS_LOOKBACK rows of extract_features(bars),
+                                   flattened. Front-padded with zeros if fewer
+                                   than OBS_LOOKBACK bars are available.
+        Portfolio half (10 floats): zeros (flat reset state) with atr_norm at slot
+                                    7 set from the latest bar's real value
+                                    (feature index 18) — mirrors env._obs() field
+                                    for the only portfolio slot that depends on
+                                    market data rather than agent state.
+        """
+        features = extract_features(bars)  # (N, N_FEATURES)
+        window = features[-OBS_LOOKBACK:]
+        if len(window) < OBS_LOOKBACK:
+            pad = np.zeros((OBS_LOOKBACK - len(window), N_FEATURES), dtype=np.float32)
+            window = np.concatenate([pad, window], axis=0)
+        flat = window.flatten().astype(np.float32)
+
+        portfolio = np.zeros(N_PORTFOLIO, dtype=np.float32)
+        if len(features) > 0:
+            portfolio[7] = float(features[-1, 18])  # atr_norm
+
+        obs = np.concatenate([flat, portfolio]).astype(np.float32)
+        return np.clip(obs, -10.0, 10.0)
 
     def act(self, obs: np.ndarray) -> tuple[str, float]:
         """Direct inference on a pre-built observation vector."""
@@ -140,12 +174,16 @@ class RLPolicy(BaseModel):
         return direction, confidence
 
     def _action_confidence(self, obs: np.ndarray) -> float:
-        """Confidence = 1 − normalised_entropy of the action distribution."""
+        """Confidence = 1 − normalised_entropy of the action distribution.
+
+        Wrapped in torch.no_grad() — inference only; avoids building the
+        backprop graph on every call.
+        """
         try:
-            import torch
-            obs_t = torch.from_numpy(obs[np.newaxis].astype(np.float32))
-            dist  = self._model.policy.get_distribution(obs_t)
-            probs = dist.distribution.probs[0].detach().numpy()
+            with torch.no_grad():
+                obs_t = torch.from_numpy(obs[np.newaxis].astype(np.float32))
+                dist  = self._model.policy.get_distribution(obs_t)
+                probs = dist.distribution.probs[0].detach().numpy()
             # Shannon entropy normalised by log(n_actions)
             h = -np.sum(probs * np.log(probs + 1e-9))
             return float(max(0.0, 1.0 - h / math.log(N_ACTIONS)))
@@ -167,5 +205,9 @@ class RLPolicy(BaseModel):
         if not path.exists():
             raise FileNotFoundError(f"Artifact not found: {path}")
         self._model = PPO.load(str(path))
+        # Disable dropout / batch-norm during inference. SB3 also handles this
+        # per-call internally, but setting it once at load is more efficient
+        # and matches conventional PyTorch inference practice.
+        self._model.policy.eval()
         self.is_fitted = True
         log.info(f"[RLPolicy] Loaded from {path}")
