@@ -4,7 +4,9 @@
       "Bash(python -m pytest tests/ -v --tb=short)",
       "Bash(python -c ' *)",
       "Bash(python scripts/backtest.py --strategy fusion --symbol BTC/USDT --tf 1h)",
-      "Bash(python -m pytest tests/test_robustness.py -v)"
+      "Bash(python -m pytest tests/test_robustness.py -v)",
+      "Bash(pytest tests/test_rl_policy.py tests/test_fusion_vote.py -v --tb=short)",
+      "Bash(python scripts/fetch_data.py --symbol BNB/USDT --timeframe 1h)"
     ]
   }
 }

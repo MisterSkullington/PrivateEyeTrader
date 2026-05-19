@@ -82,7 +82,7 @@ strategies:
     rsi_oversold: 30
 
   mean_reversion:
-    enabled: false
+    enabled: true
     timeframe: "1h"
     bb_period: 20
     bb_std: 2.0

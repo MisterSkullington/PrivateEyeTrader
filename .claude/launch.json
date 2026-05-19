@@ -1,0 +1,29 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "Dashboard (paper trading)",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "privateye.main", "--mode", "paper"],
+      "port": 8081
+    },
+    {
+      "name": "Dashboard (shadow mode)",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "privateye.main", "--mode", "shadow"],
+      "port": 8081
+    },
+    {
+      "name": "Dashboard (live trading)",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "privateye.main", "--mode", "live"],
+      "port": 8081
+    },
+    {
+      "name": "Docker (paper trading)",
+      "runtimeExecutable": "docker",
+      "runtimeArgs": ["compose", "up"],
+      "port": 8081
+    }
+  ]
+}
